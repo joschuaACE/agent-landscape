@@ -1,0 +1,452 @@
+"""Concrete unit types: Commander, Orchestrator, Worker, SwarmLeader, SwarmMember, RemoteAgent."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import random
+import re
+from typing import Any
+
+from ..a2a.client import A2AClient
+from ..a2a.task_manager import TaskContext
+from ..a2a.types import AgentCard, AgentSkill, Message, result_text
+from ..context.intel import items_from_message
+from ..runtime.regions import Region, mock_survey, parse_survey, survey_system
+from . import mock
+from .base import Agent, short
+from .roles import plan_system_prompt, synth_system_prompt
+
+SYNTH_DEFAULT = ("Your team delivered the reports below. Merge them into one coherent, well-structured final "
+                 "deliverable for the mission. Resolve conflicts, remove redundancy, keep the important details.")
+SWARM_SYNTH_DEFAULT = ("Several agents answered the same task from different perspectives. Build the consensus "
+                       "answer: keep the strongest ideas, note important disagreements, and give a clear recommendation.")
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+
+
+async def gather_with_progress(agent: Agent, label: str, coros: list) -> list[Any]:
+    """Run coroutines concurrently, updating the agent's activity as they finish."""
+    total, done = len(coros), 0
+
+    async def track(c):
+        nonlocal done
+        try:
+            return await c
+        finally:
+            done += 1
+            agent.set_status("waiting", f"{label} ({done}/{total})")
+
+    agent.set_status("waiting", f"{label} (0/{total})")
+    return await asyncio.gather(*(track(c) for c in coros), return_exceptions=True)
+
+
+def _reports(names: list[str], results: list[Any], agent: Agent | None = None) -> tuple[str, int]:
+    parts, ok = [], 0
+    for name, res in zip(names, results):
+        if isinstance(res, BaseException):
+            if agent is not None:
+                agent.runtime.log(f"{name}: delegation failed – {type(res).__name__}: {res}", agent=agent,
+                                  level="error")
+            parts.append(f"## {name}\nFAILED: {res}")
+        else:
+            ok += 1
+            parts.append(f"## {name}\n{res}")
+    return "\n\n".join(parts), ok
+
+
+# --------------------------------------------------------------------- Worker
+class Worker(Agent):
+    role = "worker"
+    title = "Specialist"
+    description = "A specialist agent that executes a focused subtask."
+
+    def __init__(self, runtime: Any, *, specialty: str = "researcher", **kw: Any) -> None:
+        p = runtime.profiles.resolve(specialty, "worker", "researcher")
+        self.profile_key, self._snapshot = p.key, p
+        self.icon, self.title, self.description = p.icon, p.title, p.description or p.prompt[:200]
+        super().__init__(runtime, **kw)
+
+    @property
+    def specialty(self) -> Any:
+        """The worker's profile (live; falls back to the version it was spawned with if it was deleted)."""
+        return self.profile or self._snapshot
+
+    def skills(self) -> list[AgentSkill]:
+        p = self.specialty
+        return [AgentSkill(id=p.key, name=p.title, description=p.description or p.prompt[:200], tags=[p.key, "worker"])]
+
+    async def run(self, text: str, ctx: TaskContext) -> str:
+        p = self.specialty
+        self.icon, self.title = p.icon, p.title
+        return await self.think(p.prompt, text, activity=f"{p.title}: {self.objective}",
+                                mock=mock.mock_report(self.name, text))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**super().to_dict(), "specialty": self.specialty.key}
+
+
+# --------------------------------------------------------------- Swarm units
+class SwarmMember(Agent):
+    role = "swarm_member"
+    icon = "🐝"
+    title = "Drone"
+    description = "A swarm member contributing one perspective."
+
+    def __init__(self, runtime: Any, *, persona: str | tuple | list = "swarm-optimist", **kw: Any) -> None:
+        if isinstance(persona, (tuple, list)):  # legacy records: (title, description)
+            persona = f"swarm-{_slug(str(persona[0]))}"
+        p = runtime.profiles.resolve(persona, "swarm_member", "swarm-optimist")
+        self.profile_key, self._snapshot = p.key, p
+        super().__init__(runtime, **kw)
+        self.title = f"Drone · {p.title}"
+
+    @property
+    def persona(self) -> tuple[str, str]:
+        p = self.profile or self._snapshot
+        return p.title, p.description
+
+    async def run(self, text: str, ctx: TaskContext) -> str:
+        p = self.profile or self._snapshot
+        return await self.think(p.prompt, text, activity=f"{p.title} view: {self.objective}",
+                                mock=mock.mock_report(f"{self.name} ({p.title})", text))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**super().to_dict(), "persona": self.persona[0]}
+
+
+class SwarmLeader(Agent):
+    role = "swarm_leader"
+    icon = "🌀"
+    title = "Hive Leader"
+    description = "Releases a swarm of agents with diverse perspectives and merges their answers."
+
+    def __init__(self, runtime: Any, *, profile: str | None = None, **kw: Any) -> None:
+        self.profile_key = runtime.profiles.resolve(profile, "swarm_leader", "hive-leader").key
+        super().__init__(runtime, **kw)
+
+    async def run(self, text: str, ctx: TaskContext) -> str:
+        rt, s = self.runtime, self.runtime.settings
+        personas = rt.profiles.by_kind("swarm_member")
+        if not personas:
+            raise RuntimeError("No enabled swarm member profiles")
+        # reuse this hive's own idle drones first (feedback rounds / re-deployments)
+        own = [rt.agents[c] for c in self.children
+               if c in rt.agents and isinstance(rt.agents[c], SwarmMember) and rt.is_reusable(rt.agents[c])]
+        size = int(ctx.metadata.get("swarm_size") or len(own) or self.options.get("swarm_size")
+                   or s.default_swarm_size)
+        size = max(1, min(size, s.max_swarm_size, max(len(personas), len(own))))
+        members: list[SwarmMember] = [rt.recruit(m, parent=self, topic_id=self.topic_id, model=self.model)
+                                      for m in own[:size]]  # type: ignore[misc]
+        veterans = len(members)
+        used = {m.profile_key for m in members}
+        pool = [p for p in personas if p.key not in used]
+        fresh = random.sample(pool, k=min(len(pool), size - veterans))
+        members += [self.spawn(SwarmMember, persona=p.key, depth=self.depth + 1, model=self.model)  # type: ignore[misc]
+                    for p in fresh]
+        size = len(members)
+        self.set_status("delegating", f"Releasing swarm of {size}" + (f" ({veterans} veterans)" if veterans else ""))
+        await asyncio.sleep(0.4)  # let the UI play the spawn animation
+        md = {"subtask": self.objective, "followup": ctx.metadata.get("followup")}
+        results = await gather_with_progress(
+            self, "Swarm working", [self.delegate(m, text, metadata=md) for m in members])
+        report, ok = _reports([f"{m.name} ({m.persona[0]})" for m in members], results, self)
+        if ok == 0:
+            raise RuntimeError("The whole swarm failed")
+        prof = self.profile or rt.profiles.resolve(None, "swarm_leader", "hive-leader")
+        return await self.think(synth_system_prompt(prof, SWARM_SYNTH_DEFAULT), f"Task:\n{text}\n\nSwarm answers:\n{report}",
+                                activity="Forming consensus", temperature=0.3, use_tools=False,
+                                mock=mock.mock_synthesis(self.name, ok))
+
+
+# --------------------------------------------------------------- Orchestrator
+_JSON_RE = re.compile(r"\{.*\}", re.S)
+
+
+def parse_plan(raw: str, limit: int) -> list[dict[str, Any]]:
+    m = _JSON_RE.search(raw or "")
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return []
+    items = data.get("subtasks") if isinstance(data, dict) else None
+    out = []
+    for it in (items or [])[:limit]:
+        if isinstance(it, dict) and (it.get("instructions") or it.get("title")):
+            out.append(it)
+    return out
+
+
+class Orchestrator(Agent):
+    role = "orchestrator"
+    icon = "🏰"
+    title = "Orchestrator"
+    description = "Plans a mission, spawns sub-agents / swarms / sub-orchestrators and merges results."
+
+    def __init__(self, runtime: Any, *, profile: str | None = None, **kw: Any) -> None:
+        p = runtime.profiles.resolve(profile, "orchestrator", "orchestrator")
+        self.profile_key = p.key
+        self.icon = p.icon
+        super().__init__(runtime, **kw)
+
+    def _prof(self) -> Any:
+        return self.profile or self.runtime.profiles.resolve(None, "orchestrator", "orchestrator")
+
+    def _model(self) -> str | None:
+        """mission model > profile model > ORCHESTRATOR_MODEL > DEFAULT_MODEL"""
+        return self.model or self._prof().model or self.runtime.settings.orchestrator_model
+
+    def _child_for(self, st: dict[str, Any]) -> Agent:
+        s = self.runtime.settings
+        strategy = str(st.get("strategy", "single")).lower()
+        if self.mode == "hierarchy" and strategy == "swarm":
+            strategy = "single"
+        if strategy == "delegate" and self.depth + 1 >= s.max_depth:
+            strategy = "single"
+        if strategy == "ally":
+            ally = self.runtime.agents.get(str(st.get("ally_id", "")))
+            if isinstance(ally, RemoteAgent):
+                return ally
+            strategy = "single"
+        specialty: str | None = None
+        kwargs: dict[str, Any]
+        if strategy == "swarm":
+            cls, kwargs = SwarmLeader, {"name_hint": "Hive"}
+        elif strategy == "delegate":  # captains inherit their orchestrator's profile
+            cls, kwargs = Orchestrator, {"name_hint": "Captain", "profile": self.profile_key}
+        else:
+            specialty = self.runtime.profiles.resolve(str(st.get("specialty", "")).lower(), "worker", "researcher").key
+            cls, kwargs = Worker, {"specialty": specialty}
+        # prefer an idle veteran (own team first, then this region) over a fresh recruit
+        rt = self.runtime
+        veteran = rt.find_veteran(cls, region_id=rt.topics[self.topic_id].region_id, parent=self,
+                                  specialty=specialty)
+        if veteran is not None:
+            return rt.recruit(veteran, parent=self, topic_id=self.topic_id, model=self.model)
+        return self.spawn(cls, depth=self.depth + 1, model=self.model, **kwargs)
+
+    @staticmethod
+    def _team_entry(agent: Agent) -> tuple[str, str, str]:
+        title = agent.objective or agent.title
+        if isinstance(agent, Worker):
+            return title, agent.specialty.key, "single"
+        return title, "researcher", "swarm" if isinstance(agent, SwarmLeader) else "delegate"
+
+    async def run(self, text: str, ctx: TaskContext) -> str:
+        rt, s = self.runtime, self.runtime.settings
+        followup = bool(ctx.metadata.get("followup"))
+        swarm_size = ctx.metadata.get("swarm_size")
+        allow_delegate = self.depth + 1 < s.max_depth
+        allow_swarm = self.mode != "hierarchy"
+        allies = [a.brief() for a in rt.agents.values() if isinstance(a, RemoteAgent)]
+        team = [rt.agents[c] for c in self.children if c in rt.agents and rt.is_reusable(rt.agents[c])]
+        prompt = f"Mission:\n{text}"
+        if team:
+            prompt += ("\n\nYour existing team (veterans with memory of their earlier work – reuse them where it "
+                       "fits by giving them matching specialty/strategy):\n"
+                       + "\n".join(f"- {a.name}: {spec} / {strat} – earlier: {short(t, 80)}"
+                                   for a, (t, spec, strat) in ((a, self._team_entry(a)) for a in team)))
+        raw = await self.think(
+            plan_system_prompt(self._prof(), rt.profiles.workers(), s.max_subtasks, allow_delegate, allow_swarm, allies),
+            prompt,
+            activity="Revising battle plan" if followup else "Drafting battle plan",
+            temperature=0.2,
+            model=self._model(),
+            mock=mock.mock_plan_from_team([self._team_entry(a) for a in team][:s.max_subtasks])
+            if followup and team else mock.mock_plan(s.max_subtasks, allow_swarm=allow_swarm,
+                                                     allow_delegate=allow_delegate and self.depth == 1),
+        )
+        plan = parse_plan(raw, s.max_subtasks) or [
+            {"title": "Execute mission", "instructions": text, "specialty": "researcher", "strategy": "single"}]
+        self.runtime.log(f"{self.name} drafted a plan with {len(plan)} subtasks", agent=self)
+
+        self.set_status("delegating", f"Dispatching {len(plan)} units")
+        children = [self._child_for(st) for st in plan]
+        await asyncio.sleep(0.4)
+        coros = []
+        for child, st in zip(children, plan):
+            title = str(st.get("title") or "Subtask")[:80]
+            prompt = (f"Overall mission:\n{short(text, 1500)}\n\nYour subtask: {title}\n"
+                      f"{st.get('instructions', '')}")
+            coros.append(self.delegate(child, prompt, metadata={
+                "subtask": title, "followup": followup, "swarm_size": swarm_size}))
+        results = await gather_with_progress(self, "Awaiting reports", coros)
+        report, ok = _reports([f"{c.name} – {st.get('title', '')}" for c, st in zip(children, plan)], results, self)
+        if ok == 0:
+            raise RuntimeError("All sub-agents failed")
+        return await self.think(synth_system_prompt(self._prof(), SYNTH_DEFAULT),
+                                f"Mission:\n{text}\n\nTeam reports:\n{report}",
+                                activity="Synthesizing reports", temperature=0.3, use_tools=False,
+                                model=self._model(),
+                                mock=mock.mock_synthesis(self.name, ok))
+
+
+# ------------------------------------------------------------------ Commander
+class Commander(Agent):
+    """Persistent entry point. Each incoming A2A message becomes a mission (topic)."""
+
+    role = "commander"
+    icon = "👑"
+    title = "Commander"
+    description = ("Entry point of the agent landscape. Send a mission; it opens a new territory, deploys an "
+                   "orchestrator (or swarm) with sub-agents and returns the final deliverable.")
+    persistent = True
+
+    def __init__(self, *args: Any, **kw: Any) -> None:
+        super().__init__(*args, **kw)
+        self.active_missions = 0
+        # one survey at a time: concurrent missions must see regions charted a moment earlier
+        self._survey_lock = asyncio.Lock()
+
+    def skills(self) -> list[AgentSkill]:
+        return [AgentSkill(
+            id="mission", name="Run mission",
+            description="Plans and executes a mission with a team of sub-agents and swarms.",
+            tags=["orchestration", "multi-agent", "swarm"],
+            input_modes=["text/plain", "text/markdown", "application/json"],
+            examples=["Design a launch plan for our new mobile app",
+                      "Research and compare vector databases for our RAG stack"])]
+
+    def card(self) -> AgentCard:
+        card = super().card()
+        # context can be attached as FilePart (text files) or DataPart {type: agent-landscape/context}
+        card.default_input_modes = ["text/plain", "text/markdown", "application/json"]
+        return card
+
+    async def survey(self, topic: Any, region_hint: str | None = None) -> Region:
+        """Decide which topic region (area of the map) a new mission belongs to – or chart a new one."""
+        rt = self.runtime
+        hinted = rt.regions.get(region_hint or "")
+        if hinted is not None and hinted.kind == "domain":
+            return hinted
+        domains = rt.domain_regions()
+        infos = [{"id": r.id, "name": r.name, "biome": r.biome, "description": r.description,
+                  "missions": [t.title for t in rt.region_missions(r.id)][-5:]} for r in domains]
+        intel = rt.intel.get(topic.id)
+        attached = ", ".join(str(e.get("name")) for e in (intel.summary if intel else [])[:12])
+        raw = await self.think(
+            survey_system(infos), f"Mission title: {topic.title}\nMission:\n{short(topic.goal, 2000)}"
+            + (f"\nAttached context: {attached}" if attached else ""),
+            activity=f"Surveying the landscape for '{short(topic.title, 32)}'", temperature=0.2, use_tools=False,
+            model=rt.settings.orchestrator_model, mock=mock_survey(topic.title, topic.goal, infos))
+        decision = parse_survey(raw)
+        existing = rt.regions.get(str(decision.get("region_id") or ""))
+        if existing is not None and existing.kind == "domain":
+            return existing
+        new = decision.get("new_region") if isinstance(decision.get("new_region"), dict) else {}
+        name = " ".join(str(new.get("name") or topic.title).split())[:40] or "New Frontier"
+        for r in domains:  # the model sometimes "creates" a region that already exists
+            if r.name.lower() == name.lower():
+                return r
+        return rt.create_region(name, str(new.get("description") or topic.goal), str(new.get("biome") or ""))
+
+    def _root_for(self, topic: Any, model: str | None, followup: bool, profile: str | None = None) -> Agent:
+        """Feedback round → the mission's previous root; new mission → an idle veteran of the region; else spawn."""
+        rt = self.runtime
+        cls = SwarmLeader if topic.mode == "swarm" else Orchestrator
+        veteran = None
+        if followup:
+            prev = rt.agents.get(topic.root_agent_id or "")
+            if prev is not None and type(prev) is cls and rt.is_reusable(prev):
+                veteran = prev
+                model = model or prev.model
+        if veteran is None:
+            veteran = rt.find_veteran(cls, region_id=topic.region_id, parent=self, profile=profile)
+        if veteran is not None:
+            return rt.recruit(veteran, parent=self, topic_id=topic.id, model=model)
+        return rt.spawn(cls, topic_id=topic.id, parent=self, depth=1, mode=topic.mode, model=model, profile=profile)
+
+    async def run(self, text: str, ctx: TaskContext) -> str:
+        md = ctx.metadata
+        rt = self.runtime
+        # A2A semantics: a message in an existing mission's contextId is feedback for that mission
+        topic = rt.topics.get(str(md.get("topic_id") or "")) or rt.topics.get(ctx.task.context_id)
+        if topic is not None and topic.kind != "mission":
+            topic = None
+        followup = topic is not None and topic.root_agent_id is not None
+        if followup and topic.status == "active":
+            raise RuntimeError(f"Mission '{topic.title}' is still running – send feedback once it has finished")
+        if topic is None:
+            topic = rt.create_topic(title=md.get("title") or short(text, 48), goal=text,
+                                    mode=md.get("mode", "auto"), topic_id=ctx.task.context_id)
+        topic.task_id = ctx.task.id
+
+        self.active_missions += 1
+        self.set_status("delegating", f"Commanding {self.active_missions} mission(s)")
+        try:
+            items = items_from_message(ctx.message)
+            if items:  # files (FilePart) + references (DataPart) attached to the A2A message
+                self.set_status("delegating", f"Gathering intel ({len(items)} item{'s' if len(items) > 1 else ''})")
+                await rt.attach_intel(topic, items)
+            if followup:
+                rt.reopen_topic(topic, text)
+                prompt = (f"FEEDBACK / FOLLOW-UP (round {topic.rounds}):\n{text}\n\n"
+                          f"Original mission:\n{short(topic.goal, 1500)}\n\n"
+                          f"Your previous deliverable:\n{short(topic.result or '(none)', 4000)}\n\n"
+                          "Revise and improve the deliverable so that it fully addresses the feedback.")
+            else:
+                if topic.center is None:
+                    async with self._survey_lock:
+                        rt.place_topic(topic, await self.survey(topic, md.get("region_id")))
+                await rt.link_region_knowledge(topic)
+                prompt = text
+            root = self._root_for(topic, md.get("model") or None, followup, md.get("profile") or None)
+            topic.root_agent_id = root.id
+            rt.topic_changed(topic)
+            result = await self.delegate(root, prompt, metadata={
+                "topic_id": topic.id, "mode": topic.mode, "swarm_size": md.get("swarm_size"),
+                "subtask": topic.title, "followup": followup})
+            rt.finish_topic(topic, "completed", result)
+            rt.schedule_archive(topic)
+            return result
+        except asyncio.CancelledError:
+            rt.finish_topic(topic, "canceled", None)
+            raise
+        except Exception as exc:
+            rt.finish_topic(topic, "failed", str(exc))
+            raise
+        finally:
+            self.active_missions -= 1
+            if self.active_missions:
+                self.set_status("delegating", f"Commanding {self.active_missions} mission(s)")
+
+
+# ---------------------------------------------------------------- RemoteAgent
+class RemoteAgent(Agent):
+    """External A2A agent (e.g. one registered in LiteLLM's Agent Gateway) shown as an ally."""
+
+    role = "ally"
+    icon = "🤝"
+    title = "Ally"
+    persistent = True
+
+    def __init__(self, *args: Any, remote_url: str, remote_card: AgentCard,
+                 headers: dict[str, str] | None = None, **kw: Any) -> None:
+        super().__init__(*args, **kw)
+        self.remote_url = remote_url.rstrip("/")
+        self.remote_card = remote_card
+        self.headers = headers or {}
+        self.description = remote_card.description
+        self.title = f"Ally · {remote_card.name}"
+
+    def brief(self) -> dict[str, str]:
+        return {"id": self.id, "name": self.remote_card.name, "description": short(self.description, 200)}
+
+    def card(self) -> AgentCard:
+        card = self.remote_card.model_copy(deep=True)
+        card.url = self.url  # proxied through this landscape
+        return card
+
+    async def run(self, text: str, ctx: TaskContext) -> str:
+        self.set_status("working", f"Remote: {short(text, 60)}")
+        client = A2AClient(self.remote_url, self.runtime.http, headers=self.headers)
+        msg = Message.of(text, role="user", metadata=ctx.metadata or None)
+        res = await client.send(msg, blocking=True)
+        return result_text(res)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**super().to_dict(), "remote_url": self.remote_url}

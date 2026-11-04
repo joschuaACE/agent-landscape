@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Landscape</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header id="hud">
+  <div class="brand">
+    <span class="hex-logo">⬢</span>
+    <div>
+      <div class="brand-name">Agent Landscape</div>
+      <div class="rank" id="rank" title="Commander rank">🎖️ Recruit</div>
+    </div>
+  </div>
+  <div class="resources">
+    <div class="res" title="Agents currently working"><span>⚔️</span><b id="r-active">0</b><small>active</small></div>
+    <div class="res" title="Missions in progress"><span>🏰</span><b id="r-missions">0</b><small>missions</small></div>
+    <div class="res" title="Missions completed"><span>🏆</span><b id="r-won">0</b><small>won</small></div>
+    <div class="res" title="Agents deployed in total"><span>🪖</span><b id="r-spawned">0</b><small>deployed</small></div>
+    <div class="res" title="A2A messages exchanged"><span>📨</span><b id="r-msgs">0</b><small>A2A msgs</small></div>
+    <div class="res" title="Tokens used"><span>🪙</span><b id="r-tokens">0</b><small>tokens</small></div>
+    <div class="res" title="Cost reported by LiteLLM"><span>💰</span><b id="r-cost">$0.00</b><small>cost</small></div>
+  </div>
+  <div class="hud-right">
+    <span id="llm-badge" class="badge">connecting…</span>
+    <span id="conn" class="conn" title="Live connection"></span>
+  </div>
+</header>
+
+<main>
+  <section id="stage">
+    <canvas id="map"></canvas>
+    <canvas id="minimap" width="200" height="140" title="Minimap – click to jump"></canvas>
+    <div id="map-controls">
+      <button data-act="zoom-in" title="Zoom in">＋</button>
+      <button data-act="zoom-out" title="Zoom out">－</button>
+      <button data-act="fit" title="Fit all (F)">⤢</button>
+      <label class="follow" title="Camera follows new missions"><input type="checkbox" id="follow" checked> follow</label>
+    </div>
+    <div id="legend">
+      <div><i style="--c:#4fc3f7"></i>working</div>
+      <div><i style="--c:#b388ff"></i>thinking</div>
+      <div><i style="--c:#ffb74d"></i>delegating</div>
+      <div><i style="--c:#ffd54f"></i>waiting</div>
+      <div><i style="--c:#66bb6a"></i>done</div>
+      <div><i style="--c:#ef5350"></i>failed</div>
+    </div>
+    <div id="tooltip" hidden></div>
+    <section id="report-view" hidden aria-label="Mission report"></section>
+    <section id="profile-view" class="overlay-view" hidden aria-label="Agent profile"></section>
+    <section id="composer" hidden aria-label="Mission briefing">
+      <form id="launch" autocomplete="off">
+        <header class="rv-head cp-head">
+          <div class="rv-title">
+            <div class="rv-crest">📜</div>
+            <div><small>COMMAND HQ</small><h2>Mission briefing</h2></div>
+          </div>
+          <div class="rv-actions">
+            <button type="button" class="btn small" id="random-mission" title="Fill with a sample mission">🎲 Sample</button>
+            <button type="button" class="btn small" data-cp="close" title="Close (Esc)">✕</button>
+          </div>
+        </header>
+        <div class="cp-body">
+          <div class="cp-main">
+            <input name="title" class="cp-title" placeholder="Mission title (optional – HQ derives one)" maxlength="80">
+            <div class="cp-editor" id="cp-editor">
+              <textarea name="goal" required placeholder="Describe the objective, constraints and the expected deliverable…&#10;&#10;Tip: type # to attach files, folders, URLs or tools – or drop files here."></textarea>
+              <div class="cp-hashmenu" id="cp-hashmenu" hidden role="listbox"></div>
+              <div class="cp-dropzone">📎 Drop files to attach as intel</div>
+            </div>
+            <div class="cp-chips" id="cp-chips"></div>
+            <div class="cp-attach-row">
+              <button type="button" class="btn small" data-attach="file" title="Attach text files (≤ 1 MB each)">📎 Files</button>
+              <button type="button" class="btn small" data-attach="folder" title="Give agents read-only access to a folder or file on this machine">📁 Folder / path</button>
+              <button type="button" class="btn small" data-attach="url" title="Fetch a web page as intel">🔗 URL</button>
+              <button type="button" class="btn small" data-attach="tools" title="MCP tools &amp; APIs from the LiteLLM gateway">🔌 Tools</button>
+              <button type="button" class="btn small" data-attach="knowledge" title="Link existing knowledge bases (vector stores) – agents can search them">📚 Knowledge</button>
+              <span class="hint"><kbd>#</kbd> attach · drop / paste files · <kbd>⌘</kbd><kbd>↵</kbd> deploy</span>
+              <input type="file" id="cp-file" multiple hidden>
+            </div>
+            <div class="cp-inline" id="cp-inline" hidden></div>
+          </div>
+          <aside class="cp-side">
+            <h4>FORMATION</h4>
+            <div class="cp-formations" role="radiogroup" aria-label="Formation">
+              <label><input type="radio" name="mode" value="auto" checked><span><b>🧠 Auto</b><small>Orchestrator picks specialists, swarms or sub-orchestrators per subtask</small></span></label>
+              <label><input type="radio" name="mode" value="hierarchy"><span><b>🏰 Hierarchy</b><small>Orchestrator + specialists + captains – focused, no swarms</small></span></label>
+              <label><input type="radio" name="mode" value="swarm"><span><b>🐝 Swarm</b><small>Diverse perspectives in parallel, merged into a consensus</small></span></label>
+            </div>
+            <h4>REGION</h4>
+            <select name="region_id" title="Topic region on the map">
+              <option value="">🧭 Auto – Command HQ picks or charts the region</option>
+            </select>
+            <h4>LEAD PROFILE</h4>
+            <select name="profile" title="System instructions &amp; tool access of the mission's root agent (edit in the 🧬 Agents tab)">
+              <option value="">default</option>
+            </select>
+            <h4>MODEL</h4>
+            <select name="model" title="LiteLLM model for this mission (overrides the profile's model)"><option value="">default model</option></select>
+            <h4>SWARM SIZE</h4>
+            <label class="slider"><input type="range" name="swarm_size" min="2" max="6" value="3"><output id="swarm-size-out">3</output></label>
+            <h4>INTEL</h4>
+            <div id="cp-intel" class="cp-intel muted small">No context attached – agents work from the briefing only.</div>
+          </aside>
+        </div>
+        <footer class="cp-foot">
+          <span id="cp-estimate" class="muted small"></span>
+          <span class="sep"></span>
+          <button type="button" class="btn" data-cp="close">Cancel</button>
+          <button class="btn primary" type="submit">⚔️ Deploy agents</button>
+        </footer>
+      </form>
+    </section>
+    <div id="empty-hint">Press <kbd>N</kbd> or click <b>⚔️ New mission briefing</b> to deploy your first agents&nbsp;→</div>
+  </section>
+
+  <aside id="sidebar">
+    <nav class="tabs">
+      <button class="tab active" data-tab="missions">⚔️ Missions</button>
+      <button class="tab" data-tab="reports">📑 Reports</button>
+      <button class="tab" data-tab="inspect">🔍 Unit</button>
+      <button class="tab" data-tab="agents" title="Agent profiles &amp; skills">🧬 Agents</button>
+      <button class="tab" data-tab="log">📜 Log</button>
+      <button class="tab" data-tab="allies">🤝 Allies</button>
+      <button class="tab" data-tab="trophies">🏅 <span id="trophy-count">0</span></button>
+    </nav>
+
+    <div class="tab-body" id="tab-missions">
+      <div class="panel quick">
+        <button type="button" class="btn primary" id="open-composer">⚔️ New mission briefing <kbd>N</kbd></button>
+        <div class="quick-row">
+          <input id="quick-goal" placeholder="Quick mission – Enter to deploy" maxlength="2000" autocomplete="off">
+          <button type="button" class="btn" id="quick-expand" title="Open in the full briefing (attach files, folders, tools …)">⤢</button>
+        </div>
+      </div>
+      <div id="mission-list"></div>
+    </div>
+
+    <div class="tab-body" id="tab-reports" hidden>
+      <p class="muted small">After-action reports: final deliverable, inputs, feedback rounds and every A2A artifact
+        (who got which orders and delivered what).</p>
+      <input id="report-search" placeholder="🔎 Search all deliverables &amp; artifacts…" autocomplete="off" spellcheck="false">
+      <div id="search-results"></div>
+      <div id="report-list"></div>
+    </div>
+
+    <div class="tab-body" id="tab-inspect" hidden>
+      <div id="inspector" class="panel"><p class="muted">Click a unit on the map to inspect it.</p></div>
+    </div>
+
+    <div class="tab-body" id="tab-agents" hidden>
+      <div id="profile-list"></div>
+    </div>
+
+    <div class="tab-body" id="tab-log" hidden>
+      <div id="log"></div>
+    </div>
+
+    <div class="tab-body" id="tab-allies" hidden>
+      <form id="ally-form" class="panel">
+        <h3>Recruit an A2A ally</h3>
+        <p class="muted small">Any A2A agent URL – e.g. an agent behind LiteLLM's Agent Gateway
+          <code>http://localhost:4000/a2a/&lt;agent&gt;</code>. Orchestrators can then hand subtasks to it.</p>
+        <input name="url" required placeholder="https://host/a2a/my-agent">
+        <input name="api_key" placeholder="API key (optional, sent as Bearer)" type="password" autocomplete="off">
+        <button class="btn primary" type="submit">🤝 Recruit</button>
+      </form>
+      <div class="panel">
+        <h3>Expose this landscape to LiteLLM</h3>
+        <p class="muted small">The Commander is a regular A2A agent. Add it to your LiteLLM proxy <code>config.yaml</code>:</p>
+        <pre id="litellm-snippet" class="code"></pre>
+        <button class="btn ghost small" id="copy-snippet">📋 Copy</button>
+      </div>
+      <div id="ally-list"></div>
+    </div>
+
+    <div class="tab-body" id="tab-trophies" hidden>
+      <div id="trophies" class="trophy-grid"></div>
+    </div>
+  </aside>
+</main>
+
+<div id="toasts"></div>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

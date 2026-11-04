@@ -1,0 +1,27 @@
+# Example LiteLLM proxy config (litellm >= 1.96 for the `agents:` key).
+# Start with:  litellm --config litellm_config.example.yaml --port 4000
+#
+# 1) model_list  → the models Agent Landscape uses (DEFAULT_MODEL / ORCHESTRATOR_MODEL)
+# 2) agents      → registers the Agent Landscape Commander in LiteLLM's Agent Gateway,
+#                  so it can be called/managed via http://localhost:4000/a2a/agent-landscape
+
+model_list:
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: claude-haiku
+    litellm_params:
+      model: anthropic/claude-3-5-haiku-latest
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+agents:
+  - agent_name: agent-landscape
+    agent_card_params:
+      name: "Agent Landscape Commander"
+      description: "Plans and executes missions with orchestrators, sub-agents and swarms."
+      url: "http://127.0.0.1:8765/a2a/commander"
+      protocolVersion: "0.3"
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
