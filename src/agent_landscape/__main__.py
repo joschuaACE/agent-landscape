@@ -58,7 +58,10 @@ def main() -> None:
     app = create_app(settings)
     config = uvicorn.Config(app, host=settings.host, port=settings.port, log_level="warning",
                             timeout_graceful_shutdown=3)
-    _Server(config, app).run()
+    try:
+        _Server(config, app).run()
+    except KeyboardInterrupt:  # uvicorn re-raises the signal after a graceful shutdown – state is saved
+        print("\n  ⬢ Agent Landscape stopped – state saved.")
 
 
 if __name__ == "__main__":

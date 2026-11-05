@@ -5,6 +5,8 @@ Tool families
 * knowledge  – kb_search (all agents, linked stores only)
                kb_catalog, kb_link, kb_create, kb_add, kb_ingest (orchestrators only)
 * mcp        – tools selected from the LiteLLM MCP gateway
+* repo       – repo_info, repo_log, repo_diff;  repo_write – edit_file, write_file, delete_file, repo_commit
+* checks     – run_check (allow-listed tests / coverage / lint / dead_code in the mission worktree, see checks.py)
 
 Specs are role-aware and recomputed every turn (a store created mid-loop becomes searchable at once).
 """
@@ -14,8 +16,11 @@ from __future__ import annotations
 import fnmatch
 import json
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from . import checks as qa
+from . import repos as gitrepo
 from .intel import MissionIntel
 from .mcp import MCPGateway, MCPTool
 from .sandbox import FileSandbox, SandboxError, is_text, walk
@@ -29,11 +34,15 @@ INGEST_MAX_FILES = 40
 FAMILY_OF = {"read_intel": "intel", "list_dir": "files", "read_file": "files", "search_files": "files",
              "kb_search": "knowledge", "kb_catalog": "knowledge_admin", "kb_link": "knowledge_admin",
              "kb_create": "knowledge_admin", "kb_add": "knowledge_admin", "kb_ingest": "knowledge_admin",
-             "use_skill": "skills", "read_skill_file": "skills"}
+             "use_skill": "skills", "read_skill_file": "skills",
+             "repo_info": "repo", "repo_log": "repo", "repo_diff": "repo",
+             "write_file": "repo_write", "edit_file": "repo_write", "delete_file": "repo_write",
+             "repo_commit": "repo_write", "run_check": "checks"}
+REPO_TOOLS = {n for n, f in FAMILY_OF.items() if f in ("repo", "repo_write", "checks")}
 # agents without a profile (tests, legacy records): access by role
-ROLE_FAMILIES = {"orchestrator": {"intel", "files", "knowledge", "knowledge_admin", "mcp", "skills"},
+ROLE_FAMILIES = {"orchestrator": {"intel", "files", "knowledge", "knowledge_admin", "mcp", "skills", "repo"},
                  "swarm_leader": set()}
-DEFAULT_FAMILIES = {"intel", "files", "knowledge", "mcp", "skills"}
+DEFAULT_FAMILIES = {"intel", "files", "knowledge", "mcp", "skills", "repo"}
 INGEST_MAX_BYTES = 2_000_000
 
 
@@ -140,6 +149,7 @@ class Toolbox:
             ]
         if self.vectors:
             specs += self._kb_specs(agent)
+        specs += self._repo_specs(agent)
         skills = self._skills_for(agent)
         if skills:
             specs += [
@@ -157,6 +167,101 @@ class Toolbox:
             desc = f"[{t.server} via LiteLLM MCP]{' ⚠️ changes data –' if t.write else ''} {t.description}"[:1000]
             specs.append({"type": "function", "function": {"name": fn, "description": desc, "parameters": schema}})
         return specs
+
+    def _repo_specs(self, agent: Any) -> list[dict[str, Any]]:
+        repos = self.intel.repos
+        fam = self.families(agent)
+        specs: list[dict[str, Any]] = []
+        if repos and "repo" in fam:
+            names = {"type": "string", "enum": [r.name for r in repos]}
+            specs += [
+                _fn("repo_info", "Overview of an attached git repository: base commit, mode (read-only / editable "
+                    "branch), commits and changed files of this mission, top-level layout.", {"repo": names}),
+                _fn("repo_log", "Git history (newest first), optionally for one file or folder.",
+                    {"repo": names, "path": {"type": "string", "description": "optional file/folder in the repo"},
+                     "limit": {"type": "integer", "description": "max commits (default 20)"}}),
+                _fn("repo_diff", "Changes made in this mission compared to the base commit (committed + uncommitted).",
+                    {"repo": names, "path": {"type": "string", "description": "optional file/folder"},
+                     "stat": {"type": "boolean", "description": "only a summary per file"}}),
+            ]
+        if repos and "checks" in fam:
+            specs.append(_fn(
+                "run_check", "Run an allow-listed quality check in a mission repo's worktree and get the result: "
+                + "; ".join(f"`{k}` = {v}" for k, v in qa.CHECKS.items())
+                + ". Slow (seconds to minutes) – narrow it with `target` when you can.",
+                {"repo": {"type": "string", "enum": [r.name for r in repos]},
+                 "check": {"type": "string", "enum": list(qa.CHECKS)},
+                 "target": {"type": "string", "description": "optional file/folder relative to the repo root"},
+                 "keyword": {"type": "string", "description": "tests only: pytest -k expression, e.g. 'repo and not e2e'"}},
+                ["repo", "check"]))
+        writable = [r.name for r in repos if r.write]
+        if writable and "repo_write" in fam:
+            names = {"type": "string", "enum": writable}
+            path = {"type": "string", "description": "file path relative to the repo root"}
+            specs += [
+                _fn("edit_file", "Replace one exact, unique snippet in a file of an editable repo (preferred for "
+                    "changes to existing files – read the file first and copy old_text exactly, incl. indentation).",
+                    {"repo": names, "path": path, "old_text": {"type": "string"}, "new_text": {"type": "string"}},
+                    ["repo", "path", "old_text", "new_text"]),
+                _fn("write_file", "Create a file or overwrite it completely in an editable repo.",
+                    {"repo": names, "path": path, "content": {"type": "string", "description": "full file content"}},
+                    ["repo", "path", "content"]),
+                _fn("delete_file", "Delete a file in an editable repo.", {"repo": names, "path": path},
+                    ["repo", "path"]),
+                _fn("repo_commit", "Commit your changes to the mission branch with a clear message "
+                    "(what and why). Commit once your change is complete and consistent.",
+                    {"repo": names, "message": {"type": "string", "description": "conventional-commit style subject, "
+                                                "optional body after a blank line"}}, ["repo", "message"]),
+            ]
+        return specs
+
+    def _repo_briefing(self, agent: Any, with_tools: bool) -> str:
+        repos = self.intel.repos
+        if not repos:
+            return ""
+        fam = self.families(agent) if with_tools else set()
+        can_write = "repo_write" in fam
+        lines = ["## Code repositories",
+                 "Each repo is checked out in an isolated git worktree for this mission. Read it with "
+                 "`list_dir` / `read_file` / `search_files` (paths relative to the repo root; prefix them with the "
+                 "repo name when several folders are attached)."]
+        for r in repos:
+            lines.append(f"\n### {r.name} – {'✍️ editable on branch `' + str(r.branch) + '`' if r.write else '👁 read-only'}")
+            if r.description:
+                lines.append(r.description)
+            lines.append(f"Base: `{r.base}` @ {r.base_sha[:8]}")
+            if r.commits:
+                lines.append("Mission commits so far: " + "; ".join(f"{c['sha']} {c['message']} ({c['author']})"
+                                                                     for c in r.commits[-8:]))
+            if r.changed:
+                lines.append(f"Changed vs base ({len(r.changed)}): " + ", ".join(r.changed[:25])
+                             + (" …" if len(r.changed) > 25 else ""))
+            if r.checks:
+                lines.append("Checks run so far: " + "; ".join(
+                    f"{c['check']}{' ' + c['target'] if c.get('target') else ''} → {c['summary']}"
+                    for c in r.checks[-5:]))
+            lines.append("```\n" + gitrepo.sandbox.tree(Path(r.path), max_entries=40, max_depth=2) + "\n```")
+        role = getattr(agent, "role", "")
+        if role == "orchestrator" and with_tools:
+            lines.append(
+                "\nAs the orchestrator: research the repo yourself first (structure, conventions, the files the "
+                "mission touches) and plan with concrete file paths. If the mission asks for code changes in an "
+                "editable repo, give the implementation subtask(s) to a specialist marked ✍️ (can edit repos) and "
+                "include the exact files, the intended change and the conventions to follow. Split work by file so "
+                "parallel specialists don't edit the same file. Review the result with `repo_diff` before you "
+                "synthesize, and list the commits/changed files in your final deliverable.")
+        elif can_write and any(r.write for r in repos):
+            lines.append(
+                "\nYou may change editable repos: read the relevant files first, follow the existing conventions, "
+                "make minimal focused changes with `edit_file` (or `write_file` for new files), check them with "
+                "`repo_diff`, then `repo_commit` with a clear message. Never invent file contents you haven't read. "
+                "Pushing / merging is done by a human after review – mention anything they must check.")
+        if "checks" in fam:
+            lines.append(
+                "\nYou can verify with `run_check` (tests / coverage / lint / dead_code). Base claims about failing "
+                "tests, coverage or unused code on its output, not on guesses"
+                + ("; run the affected tests before you `repo_commit`" if can_write else "") + ".")
+        return "\n".join(lines)
 
     def _kb_specs(self, agent: Any) -> list[dict[str, Any]]:
         specs: list[dict[str, Any]] = []
@@ -200,6 +305,9 @@ class Toolbox:
     # ----------------------------------------------------------- briefing
     def briefing(self, agent: Any = None, with_tools: bool = True) -> str:
         parts = [self.intel.briefing()] if not self.intel.empty else []
+        repo_brief = self._repo_briefing(agent, with_tools)
+        if repo_brief:
+            parts.append(repo_brief)
         skills = self._skills_for(agent) if with_tools else []
         if skills:
             parts.append("## Skills\nReusable playbooks from the repo. When your task matches one, call `use_skill` "
@@ -230,8 +338,8 @@ class Toolbox:
 
     def label(self, name: str, args: dict[str, Any]) -> str:
         """Short human description for activity bubbles / reports."""
-        key = next((args[k] for k in ("query", "path", "name", "store", "purpose", "title", "url", "input")
-                    if args.get(k)), "")
+        key = next((args[k] for k in ("check", "query", "path", "name", "store", "purpose", "title", "url",
+                                      "input", "message", "repo") if args.get(k)), "")
         return f"{name} {str(key)[:48]}".strip()
 
     async def call(self, name: str, raw_args: str | dict[str, Any] | None,
@@ -269,6 +377,8 @@ class Toolbox:
                     result = self.fs.search(str(args.get("query", "")), args.get("path"))
             elif name.startswith("kb_") and self.vectors:
                 result = await self._kb(name, args, agent)
+            elif name in REPO_TOOLS:
+                result = await self._repo(name, args, agent)
             elif name in mcp_tools:
                 tool = mcp_tools[name]
                 if self.mock:  # mock mode never calls external (possibly paid / writing) tools
@@ -298,6 +408,53 @@ class Toolbox:
         files = skill.files
         return (f"# Skill: {skill.name}\n\n{skill.instructions()}"
                 + (f"\n\n---\nExtra files (read with read_skill_file): {', '.join(files)}" if files else ""))
+
+    # -------------------------------------------------------------- repos
+    async def _repo(self, name: str, args: dict[str, Any], agent: Any) -> str:
+        mr = self.intel.repo(args.get("repo"))
+        if mr is None:
+            raise ValueError("Unknown repo. Attached: " + (", ".join(r.name for r in self.intel.repos) or "none"))
+        path = str(args.get("path") or "").strip() or None
+        if name == "repo_info":
+            await gitrepo.refresh_changes(mr)
+            return gitrepo.info(mr)
+        if name == "repo_log":
+            return await gitrepo.history(mr, path, int(args.get("limit") or 20)) or "(no commits)"
+        if name == "repo_diff":
+            out = await gitrepo.diff(mr, path, stat=bool(args.get("stat")), limit=MAX_RESULT_CHARS - 200)
+            return out or "No changes vs the base commit yet."
+        who = getattr(agent, "name", "agent")
+        if name == "run_check":
+            check = str(args.get("check") or "")
+            path = str(args.get("target") or "").strip() or path
+            if self.mock:  # mock mode never executes repo code
+                if check not in qa.CHECKS:
+                    raise ValueError(f"unknown check '{check}'")
+                result = f"✅ passed · {check} · [mock] 12 passed in 0.1s"
+                mr.checks = [*mr.checks, {"check": check, "target": path, "ok": True, "summary": "[mock] 12 passed",
+                                          "seconds": 0.1, "by": who}][-qa.HISTORY:]
+            else:
+                settings = getattr(self.runtime, "settings", None)
+                result = await qa.run_check(mr, check, python=getattr(settings, "checks_python", None),
+                                            timeout=getattr(settings, "checks_timeout", 300.0),
+                                            target=path, keyword=args.get("keyword"), by=who)
+            if self.runtime is not None and hasattr(self.runtime, "repo_changed") and self.topic_id:
+                self.runtime.repo_changed(self.topic_id, mr, by=who, what=result.split("\n", 1)[0])
+            return result
+        if name == "write_file":
+            result = await gitrepo.write_file(mr, path or "", str(args.get("content") or ""))
+        elif name == "edit_file":
+            result = await gitrepo.edit_file(mr, path or "", str(args.get("old_text") or ""),
+                                             str(args.get("new_text") or ""))
+        elif name == "delete_file":
+            result = await gitrepo.delete_file(mr, path or "")
+        elif name == "repo_commit":
+            result = await gitrepo.commit(mr, str(args.get("message") or ""), who)
+        else:
+            raise ValueError(f"Unknown repo tool {name}")
+        if self.runtime is not None and hasattr(self.runtime, "repo_changed") and self.topic_id:
+            self.runtime.repo_changed(self.topic_id, mr, by=who, what=result)
+        return result
 
     # ---------------------------------------------------------- knowledge
     async def _kb(self, name: str, args: dict[str, Any], agent: Any) -> str:
@@ -435,6 +592,17 @@ class Toolbox:
             elif self.linked() and "knowledge" in self.families(agent):
                 plan.append(("kb_search", {"store": self.linked()[0].name,
                                            "query": getattr(agent, "objective", "") or "key facts"}))
+        fam = self.families(agent)
+        for r in self.intel.repos[:1]:
+            if "repo" in fam:
+                plan.append(("repo_info", {"repo": r.name}))
+            if "checks" in fam:
+                plan.append(("run_check", {"repo": r.name, "check": "tests"}))
+            if r.write and "repo_write" in fam and getattr(agent, "role", "") == "worker":
+                who = getattr(agent, "name", "agent")
+                plan.append(("write_file", {"repo": r.name, "path": f"agent-notes/{gitrepo.slug(who)}.md",
+                                            "content": f"# {who}\n\n[mock] {getattr(agent, 'objective', '')}\n"}))
+                plan.append(("repo_commit", {"repo": r.name, "message": f"docs: notes from {who}"}))
         skills = self._skills_for(agent)
         if skills and getattr(agent, "role", "") in ("worker", "swarm_member"):
             plan.append(("use_skill", {"name": skills[0].name}))

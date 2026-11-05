@@ -2,13 +2,20 @@ import { HexMap, STATUS_COLORS, ACTIVE } from './map.js';
 import { createReportView } from './report.js';
 import { createComposer } from './composer.js';
 import { createProfiles } from './profiles.js';
+import { createOps } from './ops.js';
+import { createTeams } from './teams.js';
 
 const $ = (s, el = document) => el.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmt = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e4 ? `${(n / 1e3).toFixed(1)}k` : String(n ?? 0));
 
-const store = { agents: new Map(), topics: new Map(), regions: new Map(), stats: {}, config: {}, selected: null };
-const map = new HexMap($('#map'), $('#minimap'), store, { onSelect: select, onHover: hover });
+const store = { agents: new Map(), topics: new Map(), regions: new Map(), stats: {}, config: {}, ops: null, selected: null };
+// full-screen panels (briefing, report, profile editor) hide the map → it stops painting while they are open
+const map = new HexMap($('#map'), $('#minimap'), store, {
+  onSelect: select, onHover: hover,
+  onBanner: (id) => { if (store.topics.get(id)?.kind === 'ops') switchTab('ops'); },
+  isCovered: () => !$('#composer').hidden || !$('#report-view').hidden || !$('#profile-view').hidden,
+});
 const reports = createReportView({
   el: $('#report-view'), store, api, toast, map,
   onInspect: (id) => { reports.close(); select(id); map.focusAgent(id); },
@@ -21,8 +28,8 @@ const isPlaced = (t) => t && t.q !== null && t.q !== undefined;
 // ------------------------------------------------------------------ socket
 function connect() {
   const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
-  ws.onopen = () => $('#conn').classList.add('on');
-  ws.onclose = () => { $('#conn').classList.remove('on'); setTimeout(connect, 1500); };
+  ws.onopen = () => { $('#conn').classList.add('on'); renderLlmPop(); };
+  ws.onclose = () => { $('#conn').classList.remove('on'); renderLlmPop(); setTimeout(connect, 1500); };
   ws.onmessage = (e) => handle(JSON.parse(e.data));
 }
 
@@ -33,6 +40,7 @@ function handle(ev) {
       store.topics = new Map(ev.topics.map((t) => [t.id, t]));
       store.regions = new Map((ev.regions || []).map((r) => [r.id, r]));
       store.config = ev.config;
+      store.ops = ev.ops || null;
       updateStats(ev.stats);
       map.territories.clear();
       map.refreshLand();
@@ -48,9 +56,44 @@ function handle(ev) {
       }
       break;
     }
+    case 'config_changed':
+      store.config = ev.config;
+      renderConfig();
+      break;
     case 'profiles_changed':
       if (!$('#tab-agents').hidden) profiles.load();
       break;
+    case 'teams_changed':
+      if (!$('#tab-teams').hidden) teams.load();
+      break;
+    case 'ops_polled':
+      ops.apply(ev);
+      break;
+    case 'ops_message': {
+      ops.apply(ev);
+      const e = ev.entry;
+      if (e.relevant) {
+        const m = store.agents.get(e.monitor_id);
+        if (m) map.floatText(m, '📨 relevant', '#80deea');
+        addLog(e.channel === 'teams' ? '💬' : '📧', `<b>${esc(m?.name || 'Monitor')}</b> flagged a message from <b>${esc(String(e.sender).split('<')[0])}</b>: ${esc(e.subject || e.preview)}`, 'info', e.monitor_id);
+      }
+      break;
+    }
+    case 'ops_proposal': {
+      const p = ops.apply(ev);
+      if (p) {
+        toast('📨', `<b>${esc(p.title)}</b> – the Commander prepared a mission. Click to review.`, 'achievement', 'MISSION PROPOSAL')
+          .addEventListener('click', () => switchTab('ops'));
+        addLog('📨', `Commander proposes <b>${esc(p.title)}</b> – awaiting your approval`, 'success', 'commander');
+      }
+      break;
+    }
+    case 'repo_changed': {
+      reports.repoChanged(ev.topic_id);
+      const a = [...store.agents.values()].find((x) => x.name === ev.by && x.topic_id === ev.topic_id);
+      if (a) map.floatText(a, `📦 ${ev.commits} commit${ev.commits === 1 ? '' : 's'}`, '#b9f6ca');
+      break;
+    }
     case 'topic_created':
       store.topics.set(ev.topic.id, ev.topic);
       if (ev.topic.kind === 'mission') addLog('🧭', `HQ is surveying <b>${esc(ev.topic.title)}</b>`, 'info');
@@ -60,6 +103,7 @@ function handle(ev) {
       const t = ev.topic;
       store.topics.set(t.id, t);
       map.onTopicChanged(t.id);
+      if (t.team && (!prev || prev.status !== t.status || prev.rounds !== t.rounds) && !$('#tab-teams').hidden) teams.load();
       if (prev && !isPlaced(prev) && isPlaced(t) && t.kind === 'mission') { // HQ placed the territory
         const reg = store.regions.get(t.region_id);
         addLog('🏰', `<b>${esc(t.title)}</b> claimed a territory in ${reg ? `${reg.icon} <b>${esc(reg.name)}</b>` : 'the map'}`, 'info');
@@ -182,10 +226,10 @@ function renderConfig() {
   const c = store.config;
   const badge = $('#llm-badge');
   const problems = c.model_problems || [];
-  badge.className = `badge ${problems.length ? 'bad' : c.mock ? 'mock' : 'live'}`;
-  badge.textContent = problems.length ? `⚠️ ${c.default_model} · not on LiteLLM proxy`
-    : c.mock ? '🧪 MOCK · LiteLLM mock_response' : `⚡ ${c.default_model}${c.proxy ? ' · via LiteLLM proxy' : ''}`;
-  badge.title = problems.join('\n');
+  $('#llm-chip').className = `badge ${problems.length ? 'bad' : c.mock ? 'mock' : 'live'}`;
+  badge.textContent = problems.length ? `⚠️ ${c.default_model}` : c.mock ? '🧪 MOCK' : c.default_model;
+  $('#llm-chip').title = problems.length ? problems.join('\n') : 'Model & connection';
+  renderLlmPop();
   if (problems.length && !renderConfig.warned) {
     renderConfig.warned = true;
     problems.forEach((p) => toast('⚠️', esc(p), 'error'));
@@ -202,6 +246,54 @@ function renderConfig() {
       protocolVersion: "0.3"`;
 }
 
+function renderLlmPop() {
+  const el = $('#llm-pop');
+  if (!el || el.contains(document.activeElement)) return; // don't close an open dropdown
+  const c = store.config || {};
+  const problems = c.model_problems || [];
+  const live = $('#conn').classList.contains('on');
+  const opts = [...new Set([...(c.default_model ? [c.default_model] : []), ...modelList])];
+  el.innerHTML = `<h4>⚡ MODEL &amp; CONNECTION</h4>
+    <dl class="kv">
+      <dt>Server</dt><dd><span class="dot ${live ? 'ok' : 'bad'}"></span> ${live ? 'live (WebSocket)' : 'reconnecting…'}</dd>
+      <dt>Mode</dt><dd>${c.mock ? '🧪 Mock – LiteLLM <code>mock_response</code>' : c.proxy ? '⚡ Live via LiteLLM proxy' : '⚡ Live (direct)'}</dd>
+      <dt>Default model</dt><dd>${opts.length > 1 ? `<select id="default-model" title="Applies to new LLM turns of units without a mission, profile or pinned model – until restart">
+        ${opts.map((m) => `<option value="${esc(m)}" ${m === c.default_model ? 'selected' : ''}>${esc(m)}</option>`).join('')}</select>`
+        : esc(c.default_model || '—')}</dd>
+      <dt>Vector store</dt><dd>${esc(c.vectors || '—')}${c.mcp?.length ? ` · MCP ${c.mcp.length}` : ''}</dd>
+    </dl>
+    ${problems.length ? `<div class="pop-warn">${problems.map((p) => `<p>⚠️ ${esc(p)}</p>`).join('')}</div>` : ''}
+    <p class="muted small">Switching here lasts until the server restarts – set <code>DEFAULT_MODEL</code> in <code>.env</code> to keep it.</p>`;
+}
+$('#llm-pop').addEventListener('change', async (e) => {
+  if (e.target.id !== 'default-model') return;
+  const model = e.target.value;
+  e.target.blur();
+  try {
+    store.config = await api('/api/config', { method: 'PATCH', body: JSON.stringify({ default_model: model }) });
+    renderConfig();
+    toast('🎛️', `Default model is now <b>${esc(model)}</b>`, 'success');
+  } catch { renderLlmPop(); }
+});
+
+// -------------------------------------------------------------- popovers
+function closePops(except = null) {
+  document.querySelectorAll('.pop').forEach((p) => { if (p !== except) p.hidden = true; });
+  document.querySelectorAll('[data-pop]').forEach((b) => b.classList.toggle('open', !!except && b.dataset.pop === except.id));
+}
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-pop]');
+  if (btn) {
+    const pop = document.getElementById(btn.dataset.pop);
+    const show = pop.hidden;
+    closePops(show ? pop : null);
+    pop.hidden = !show;
+    if (show && pop.id === 'llm-pop') { loadModels(); renderLlmPop(); }
+    return;
+  }
+  if (!e.target.closest('.pop')) closePops();
+});
+
 // --------------------------------------------------------------- rendering
 let renderQueued = false;
 function scheduleRender() {
@@ -214,11 +306,20 @@ function scheduleRender() {
     renderInspector();
     renderAllies();
     renderReportList();
+    renderOps();
     $('#empty-hint').hidden = [...store.topics.values()].some((t) => t.kind === 'mission');
   });
 }
 
 function topicAgents(id) { return [...store.agents.values()].filter((a) => a.topic_id === id); }
+
+function renderOps() {
+  const n = ops.pending().length;
+  const badge = $('#ops-count');
+  badge.hidden = !n;
+  badge.textContent = n ? String(n) : '';
+  if (!$('#tab-ops').hidden) ops.render();
+}
 
 const feedbackOpen = new Set();
 const feedbackDrafts = new Map();
@@ -409,15 +510,18 @@ function renderRegionSelect() {
   if (sig === regionSelectSig || document.activeElement === sel) return;
   regionSelectSig = sig;
   const keep = sel.value;
+  const proposed = sel.querySelector('option[value="__new__"]'); // new region suggested by an ops proposal
   sel.innerHTML = '<option value="">🧭 Auto – Command HQ picks or charts the region</option>'
     + regions.map((r) => `<option value="${r.id}">${r.icon} ${esc(r.name)} (${esc(r.biome_label)})</option>`).join('');
-  sel.value = regions.some((r) => r.id === keep) ? keep : '';
+  if (proposed) sel.append(proposed);
+  sel.value = regions.some((r) => r.id === keep) || (proposed && keep === '__new__') ? keep : '';
 }
 
 function renderInspector() {
   const el = $('#inspector');
   const a = store.selected && store.agents.get(store.selected);
-  if (!a) { el.innerHTML = '<p class="muted">Click a unit on the map to inspect it.</p>'; return; }
+  if (!a) { $('#unit-panel').hidden = true; return; }
+  if (document.activeElement?.matches('#inspector select') && document.activeElement.dataset.agentId === a.id) return; // don't close an open dropdown
   const parent = a.parent_id && store.agents.get(a.parent_id);
   const topic = store.topics.get(a.topic_id);
   const curLvl = 40 * (a.level - 1) ** 2, nextLvl = 40 * a.level ** 2;
@@ -437,7 +541,7 @@ function renderInspector() {
       <dt>Territory</dt><dd><a class="link" data-topic="${a.topic_id}">${esc(topic?.title || a.topic_id)}</a></dd>
       <dt>Role</dt><dd>${esc(a.role)}${a.specialty ? ` · ${esc(a.specialty)}` : ''}${a.persona ? ` · ${esc(a.persona)}` : ''}</dd>
       ${a.profile ? `<dt>Profile</dt><dd><a class="link" data-profile-open="${esc(a.profile)}" title="Edit system instructions &amp; tool access">🧬 ${esc(a.profile)}</a> <small class="muted">rev ${esc(a.profile_rev || '?')}</small></dd>` : ''}
-      <dt>Model</dt><dd>${esc(a.model)}</dd>
+      <dt>Model</dt><dd>${modelPicker(a)}</dd>
       <dt>Reports to</dt><dd>${parent ? `<a class="link" data-agent="${parent.id}">${parent.icon} ${esc(parent.name)}</a>` : '—'}</dd>
       <dt>Tokens</dt><dd>${fmt(a.tokens)} · $${a.cost.toFixed(4)}</dd>
       <dt>Tasks done</dt><dd>${a.tasks_done}${a.veteran ? ' · 🎖️ veteran' : ''}${a.recruitments ? ` · re-deployed ${a.recruitments}×` : ''}</dd>
@@ -454,13 +558,42 @@ function renderInspector() {
   if (scroll) { const pre = el.querySelector('details[open] pre'); if (pre) pre.scrollTop = scroll; }
 }
 
+let modelList = []; // filled by loadModels()
+const MODEL_SOURCE = { mission: 'mission model', profile: 'profile model', default: 'default' };
+function modelPicker(a) {
+  const shown = String(a.model || '').replace(/^litellm_proxy\//, '');
+  if (a.role === 'ally') return esc(shown);
+  const pinned = a.pinned_model;
+  const opts = [...new Set([...modelList, ...(pinned ? [pinned] : [])])];
+  const inherit = pinned ? 'inherit (unpin)' : `${shown} · ${MODEL_SOURCE[a.model_source] || a.model_source}`;
+  return `<select class="model-pick${pinned ? ' pinned' : ''}" data-agent-id="${a.id}" title="Pin a model for this unit – applies from its next LLM turn and survives re-deployment">
+    <option value="">${pinned ? '↩️ ' : ''}${esc(inherit)}</option>
+    ${opts.map((m) => `<option value="${esc(m)}" ${m === pinned ? 'selected' : ''}>📌 ${esc(m)}</option>`).join('')}
+  </select>`;
+}
+$('#inspector').addEventListener('change', async (e) => {
+  const sel = e.target.closest('select.model-pick');
+  if (!sel) return;
+  const id = sel.dataset.agentId;
+  try {
+    const a = await api(`/api/agents/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ pinned_model: sel.value || null }) });
+    store.agents.set(a.id, { ...store.agents.get(a.id), ...a });
+    toast('🎛️', sel.value ? `${esc(a.name)} now uses <b>${esc(sel.value)}</b>` : `${esc(a.name)} inherits its model again`);
+  } catch { /* toast shown by api() */ }
+  sel.blur();
+  scheduleRender();
+});
+
 $('#inspector').addEventListener('click', (e) => {
   const ag = e.target.closest('[data-agent]')?.dataset.agent;
   const tp = e.target.closest('[data-topic]')?.dataset.topic;
   const pf = e.target.closest('[data-profile-open]')?.dataset.profileOpen;
   if (ag) { select(ag); map.focusAgent(ag); }
   if (tp) map.focusTopic(tp);
-  if (pf) { switchTab('agents'); profiles.open(pf); }
+  if (pf) { select(null); switchTab('agents'); profiles.open(pf); }
+});
+$('#unit-panel').addEventListener('click', (e) => {
+  if (e.target.closest('[data-up=close]')) select(null);
 });
 
 function renderAllies() {
@@ -477,7 +610,8 @@ $('#ally-list').addEventListener('click', (e) => {
 function select(id) {
   store.selected = id;
   map.select(id);
-  if (id) switchTab('inspect');
+  $('#unit-panel').hidden = !id;
+  if (id) $('#unit-panel .up-body').scrollTop = 0;
   scheduleRender();
 }
 
@@ -502,7 +636,16 @@ function addLog(icon, html, level = '', agentId = null) {
   row.innerHTML = `<time>${t.toTimeString().slice(0, 8)}</time><span>${icon}</span><span class="txt">${html}</span>`;
   el.prepend(row);
   while (el.childElementCount > LOG_MAX) el.lastElementChild.remove();
+  const latest = $('#log-latest');
+  latest.innerHTML = `<time>${t.toTimeString().slice(0, 5)}</time> ${icon} ${html}`;
+  latest.className = `ld-latest ${level || ''}`;
 }
+function toggleLog(open = $('#log-dock').classList.contains('collapsed')) {
+  $('#log-dock').classList.toggle('collapsed', !open);
+  localStorage.setItem('al.logOpen', open ? '1' : '0');
+}
+$('#log-toggle').addEventListener('click', () => toggleLog());
+toggleLog(localStorage.getItem('al.logOpen') === '1');
 $('#log').addEventListener('click', (e) => {
   const id = e.target.closest('[data-agent]')?.dataset.agent;
   if (id && store.agents.has(id)) { select(id); map.focusAgent(id); }
@@ -513,8 +656,11 @@ function toast(icon, html, kind = '', title = '') {
   const el = document.createElement('div');
   el.className = `toast ${kind}`;
   el.innerHTML = `<span class="ico">${icon}</span><div>${title ? `<div class="t-title">${title}</div>` : ''}<div>${html}</div></div>`;
-  $('#toasts').append(el);
-  setTimeout(() => el.remove(), 4200);
+  const box = $('#toasts');
+  box.append(el);
+  while (box.children.length > 4) box.firstElementChild.remove(); // never a wall of toasts
+  setTimeout(() => el.remove(), kind === 'achievement' ? 9000 : 6200);
+  return el;
 }
 
 // --------------------------------------------------------- achievements
@@ -579,6 +725,17 @@ function countLaunch() {
 }
 const composer = createComposer({ el: $('#composer'), store, api, toast, onDeployed: countLaunch });
 const profiles = createProfiles({ listEl: $('#profile-list'), viewEl: $('#profile-view'), store, api, toast });
+const ops = createOps({
+  el: $('#ops-panel'), store, api, toast, composer,
+  onSelectAgent: (id) => { select(id); map.focusAgent(id); },
+  onFocusTopic: (id) => map.focusTopic(id),
+});
+const teams = createTeams({
+  el: $('#teams-panel'), api, toast,
+  onOpenReport: (id) => { switchTab('reports'); reports.open(id); map.focusTopic(id); }, // Missions › Archive
+  onFocusTopic: (id) => map.focusTopic(id),
+  onOpenProfile: (key) => { switchTab('agents'); profiles.open(key); },
+});
 $('[name=swarm_size]').addEventListener('input', (e) => {
   e.target.dataset.touched = '1';
   $('#swarm-size-out').textContent = e.target.value;
@@ -618,12 +775,36 @@ $('#copy-snippet').addEventListener('click', async () => {
 });
 
 // ------------------------------------------------------------ chrome
-function switchTab(name) {
-  document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === name));
-  document.querySelectorAll('.tab-body').forEach((b) => { b.hidden = b.id !== `tab-${name}`; });
-  if (name === 'agents') profiles.load();
+// 4 top-level tabs; Missions and Roster each hold two panes (segmented control)
+const PANE_TAB = { missions: 'missions', reports: 'missions', ops: 'ops', teams: 'teams', agents: 'agents', allies: 'agents' };
+const lastPane = { missions: 'missions', ops: 'ops', teams: 'teams', agents: 'agents' };
+function switchTab(pane) {
+  const tab = PANE_TAB[pane] || 'missions';
+  lastPane[tab] = pane;
+  $('#unit-panel').hidden = true; // the unit slide-over sits on top of the tabs
+  document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === tab));
+  document.querySelectorAll('.tab-body').forEach((b) => { b.hidden = b.id !== `tab-${pane}`; });
+  if (pane === 'agents') profiles.load();
+  if (pane === 'ops') ops.render();
+  if (pane === 'teams') teams.load();
 }
-document.querySelectorAll('.tab').forEach((t) => t.addEventListener('click', () => switchTab(t.dataset.tab)));
+document.querySelectorAll('.tab').forEach((t) => t.addEventListener('click', () => {
+  if (store.selected) { store.selected = null; map.select(null); }
+  switchTab(lastPane[t.dataset.tab]);
+}));
+$('#sidebar').addEventListener('click', (e) => {
+  const seg = e.target.closest('.seg [data-pane]');
+  if (seg) switchTab(seg.dataset.pane);
+});
+// clicks / typing anywhere outside the map (sidebar, HUD popovers, log dock, overlays): let the UI's next
+// frame paint before the (expensive) map frame – INP. Map / minimap input keeps the map painting.
+for (const ev of ['pointerdown', 'keydown']) {
+  document.addEventListener(ev, (e) => {
+    // map shortcuts (+ / - / f on <body>) must keep painting, even with key repeat
+    if (e.target === document.body || e.target.closest?.('#map, #minimap')) return;
+    map.yieldTo();
+  }, { capture: true, passive: true });
+}
 $('#map-controls').addEventListener('click', (e) => {
   const act = e.target.closest('button')?.dataset.act;
   if (act === 'zoom-in') map.zoomBy(1.25);
@@ -631,12 +812,14 @@ $('#map-controls').addEventListener('click', (e) => {
   if (act === 'fit') map.fit();
 });
 window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && [...document.querySelectorAll('.pop')].some((p) => !p.hidden)) { closePops(); return; }
   if (e.key === 'Escape' && profiles.isOpen()) { profiles.close(); return; }
   if (e.key === 'Escape' && composer.isOpen()) { composer.close(); return; }
   if (e.target.matches('input, textarea, select')) return;
   if (e.key === 'n' && !e.metaKey && !e.ctrlKey) { e.preventDefault(); composer.open(); return; }
   if (composer.isOpen()) return;
   if (e.key === 'f') map.fit();
+  if (e.key === 'l') toggleLog();
   if (e.key === 'Escape') { if (reports.isOpen()) reports.close(); else select(null); }
   if (e.key === '+' || e.key === '=') map.zoomBy(1.2);
   if (e.key === '-') map.zoomBy(0.83);
@@ -650,11 +833,13 @@ window.addEventListener('keydown', (e) => {
 async function loadModels() {
   try {
     const { models, default: def } = await (await fetch('/api/models')).json();
+    modelList = models || [];
     const sel = $('#composer [name=model]');
     const keep = sel.value;
     sel.innerHTML = `<option value="">default (${esc(def)})</option>` +
       models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
     sel.value = models.includes(keep) ? keep : ''; // drop stale picks
+    renderLlmPop();
   } catch { /* ignore */ }
 }
 

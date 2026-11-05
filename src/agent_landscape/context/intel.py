@@ -14,13 +14,13 @@ import html
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Awaitable, Callable, Literal
 
 import httpx
 from pydantic import BaseModel, Field
 
 from ..a2a.types import DataPart, FilePart, Message, Part, TextPart
-from . import sandbox
+from . import documents, sandbox
 from .mcp import MCPGateway, MCPTool
 
 CONTEXT_TYPE = "agent-landscape/context"
@@ -29,7 +29,7 @@ MAX_DOC_CHARS = 400_000
 
 
 class ContextItem(BaseModel):
-    kind: Literal["file", "path", "url", "tool", "note", "store"]
+    kind: Literal["file", "path", "url", "tool", "note", "store", "repo"]
     name: str | None = Field(default=None, max_length=300)
     content: str | None = Field(default=None, max_length=2_000_000)  # file / note text
     mime: str | None = None
@@ -37,6 +37,9 @@ class ContextItem(BaseModel):
     url: str | None = Field(default=None, max_length=2000)
     tool: str | None = Field(default=None, max_length=300)
     store: str | None = Field(default=None, max_length=300)  # knowledge base name or id
+    repo: str | None = Field(default=None, max_length=64)  # registered git repo (repos.yaml)
+    ref: str | None = Field(default=None, max_length=200)  # base branch / tag / commit (default: repo branch)
+    write: bool = False  # True → agents may change files on a mission branch
 
 
 @dataclass
@@ -57,11 +60,18 @@ class MissionIntel:
     roots: list[Path] = field(default_factory=list)
     tools: list[MCPTool] = field(default_factory=list)
     stores: list[Any] = field(default_factory=list)  # vectorstore.StoreInfo picked by the user
+    repos: list[Any] = field(default_factory=list)  # repos.MissionRepo (git worktrees; their paths are in roots too)
     summary: list[dict[str, Any]] = field(default_factory=list)  # for UI / reports (incl. errors)
 
     @property
     def empty(self) -> bool:
         return not (self.docs or self.roots or self.tools)
+
+    def repo(self, name: str | None) -> Any:
+        """Mission repo by name (the only one if name is empty)."""
+        if not name and len(self.repos) == 1:
+            return self.repos[0]
+        return next((r for r in self.repos if r.name == str(name or "").strip().lower()), None)
 
     def add_doc(self, doc: Doc) -> Doc:
         name, n = doc.name, 2
@@ -90,9 +100,11 @@ class MissionIntel:
                     preview = " ".join(d.text[:300].split())
                     out.append(f"- **{d.name}** ({d.source}, {d.size:,} chars) – preview: {preview}… "
                                f"→ call `read_intel` with name=\"{d.name}\" to read it.")
-        if self.roots:
+        repo_paths = {str(r.path) for r in self.repos}
+        folders = [r for r in self.roots if str(r) not in repo_paths]  # repos get their own section (toolbox)
+        if folders:
             out.append("### Folders (read-only; use list_dir / read_file / search_files)")
-            for r in self.roots:
+            for r in folders:
                 out.append(f"{r}/\n{sandbox.tree(r, max_entries=40)}")
         if self.tools:
             out.append("### External tools (via LiteLLM MCP gateway)")
@@ -126,9 +138,17 @@ def items_from_message(msg: Message) -> list[ContextItem]:
                     raw = base64.b64decode(f["bytes"])
                 except Exception:  # noqa: BLE001
                     continue
+                name = f.get("name") or "attachment"
+                if documents.kind_of(name):  # PDF / Office over A2A → markdown (blocking – call via a thread)
+                    try:
+                        text, kind = documents.convert(name, raw)
+                        items.append(ContextItem(kind="file", name=name, mime="text/markdown", content=text))
+                    except documents.ConversionError as exc:
+                        items.append(ContextItem(kind="note", name=name, content=f"(attachment not readable: {exc})"))
+                    continue
                 if b"\0" in raw[:8192]:
-                    items.append(ContextItem(kind="note", name=f.get("name") or "binary",
-                                             content=f"(binary attachment {f.get('name')} – {len(raw)} bytes – not readable)"))
+                    items.append(ContextItem(kind="note", name=name,
+                                             content=f"(binary attachment {name} – {len(raw)} bytes – not readable)"))
                     continue
                 items.append(ContextItem(kind="file", name=f.get("name"), mime=f.get("mimeType"),
                                          content=raw.decode("utf-8", errors="replace")))
@@ -172,7 +192,8 @@ async def fetch_url(url: str, http: httpx.AsyncClient) -> tuple[str, str]:
 
 
 async def resolve(items: list[ContextItem], *, allowed_roots: list[str], http: httpx.AsyncClient,
-                  mcp: MCPGateway, offline: bool = False, vectors: Any = None) -> MissionIntel:
+                  mcp: MCPGateway, offline: bool = False, vectors: Any = None,
+                  repo_hook: Callable[[ContextItem], Awaitable[tuple[Any, str | None]]] | None = None) -> MissionIntel:
     intel = MissionIntel()
     tool_refs: list[str] = []
     for it in items:
@@ -214,9 +235,22 @@ async def resolve(items: list[ContextItem], *, allowed_roots: list[str], http: h
                 intel.stores.append(store)
                 entry.update(name=store.name, detail=f"knowledge base · {store.files} files"
                              + ("" if store.owned else " · read-only"))
+            elif it.kind == "repo":
+                if repo_hook is None:
+                    raise ValueError("Git repositories are not available here")
+                mr, warning = await repo_hook(it)
+                if not any(r.name == mr.name for r in intel.repos):
+                    intel.repos.append(mr)
+                if Path(mr.path) not in intel.roots:
+                    intel.roots.append(Path(mr.path))
+                entry.update(name=mr.name, repo=mr.name, write=mr.write, branch=mr.branch,
+                             detail=f"git repo · {mr.base} @ {mr.base_sha[:7]} · "
+                             + (f"✍️ editable on {mr.branch}" if mr.write else "read-only")
+                             + (f" · ⚠️ {warning}" if warning else ""))
             entry["ok"] = True
         except Exception as exc:  # noqa: BLE001 – report per item, never fail the mission
-            entry.update(name=it.name or it.path or it.url or it.tool or it.store, ok=False, error=str(exc)[:300])
+            entry.update(name=it.name or it.path or it.url or it.tool or it.store or it.repo, ok=False,
+                         error=str(exc)[:300])
         intel.summary.append(entry)
     if tool_refs:
         intel.tools = await mcp.select(tool_refs)

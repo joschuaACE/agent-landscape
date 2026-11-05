@@ -13,23 +13,39 @@
 <header id="hud">
   <div class="brand">
     <span class="hex-logo">⬢</span>
-    <div>
+    <div class="pop-anchor">
       <div class="brand-name">Agent Landscape</div>
-      <div class="rank" id="rank" title="Commander rank">🎖️ Recruit</div>
+      <button type="button" class="rank" data-pop="trophy-pop" title="Rank &amp; trophies" aria-haspopup="dialog">
+        <span id="rank">🎖️ Recruit</span> · 🏅 <span id="trophy-count">0</span> ▾
+      </button>
+      <div class="pop pop-left" id="trophy-pop" hidden role="dialog" aria-label="Trophies">
+        <h4>🏅 TROPHIES</h4>
+        <div id="trophies" class="trophy-grid"></div>
+      </div>
     </div>
   </div>
   <div class="resources">
     <div class="res" title="Agents currently working"><span>⚔️</span><b id="r-active">0</b><small>active</small></div>
     <div class="res" title="Missions in progress"><span>🏰</span><b id="r-missions">0</b><small>missions</small></div>
-    <div class="res" title="Missions completed"><span>🏆</span><b id="r-won">0</b><small>won</small></div>
-    <div class="res" title="Agents deployed in total"><span>🪖</span><b id="r-spawned">0</b><small>deployed</small></div>
-    <div class="res" title="A2A messages exchanged"><span>📨</span><b id="r-msgs">0</b><small>A2A msgs</small></div>
-    <div class="res" title="Tokens used"><span>🪙</span><b id="r-tokens">0</b><small>tokens</small></div>
     <div class="res" title="Cost reported by LiteLLM"><span>💰</span><b id="r-cost">$0.00</b><small>cost</small></div>
+    <div class="pop-anchor">
+      <button type="button" class="res more" data-pop="stats-pop" title="All statistics" aria-haspopup="dialog">⋯</button>
+      <div class="pop pop-center" id="stats-pop" hidden role="dialog" aria-label="Statistics">
+        <h4>📊 STATISTICS</h4>
+        <div class="stat-grid">
+          <div class="res" title="Missions completed"><span>🏆</span><b id="r-won">0</b><small>missions won</small></div>
+          <div class="res" title="Agents deployed in total"><span>🪖</span><b id="r-spawned">0</b><small>agents deployed</small></div>
+          <div class="res" title="A2A messages exchanged"><span>📨</span><b id="r-msgs">0</b><small>A2A messages</small></div>
+          <div class="res" title="Tokens used"><span>🪙</span><b id="r-tokens">0</b><small>tokens</small></div>
+        </div>
+      </div>
+    </div>
   </div>
-  <div class="hud-right">
-    <span id="llm-badge" class="badge">connecting…</span>
-    <span id="conn" class="conn" title="Live connection"></span>
+  <div class="hud-right pop-anchor">
+    <button type="button" id="llm-chip" class="badge" data-pop="llm-pop" aria-haspopup="dialog">
+      <i id="conn" class="conn" title="Live connection"></i><span id="llm-badge">connecting…</span><span class="caret">▾</span>
+    </button>
+    <div class="pop pop-right" id="llm-pop" hidden role="dialog" aria-label="Model &amp; connection"></div>
   </div>
 </header>
 
@@ -43,12 +59,19 @@
       <button data-act="fit" title="Fit all (F)">⤢</button>
       <label class="follow" title="Camera follows new missions"><input type="checkbox" id="follow" checked> follow</label>
     </div>
+    <section id="log-dock" class="collapsed" aria-label="Event log">
+      <button type="button" class="ld-head" id="log-toggle" title="Show / hide the event log (L)">
+        <span>📜</span><span class="ld-latest" id="log-latest">No events yet</span><span class="caret">▴</span>
+      </button>
+      <div id="log"></div>
+    </section>
     <div id="legend">
       <div><i style="--c:#4fc3f7"></i>working</div>
       <div><i style="--c:#b388ff"></i>thinking</div>
       <div><i style="--c:#ffb74d"></i>delegating</div>
       <div><i style="--c:#ffd54f"></i>waiting</div>
       <div><i style="--c:#66bb6a"></i>done</div>
+      <div><i style="--c:#26c6da"></i>monitoring</div>
       <div><i style="--c:#ef5350"></i>failed</div>
     </div>
     <div id="tooltip" hidden></div>
@@ -74,17 +97,15 @@
               <div class="cp-hashmenu" id="cp-hashmenu" hidden role="listbox"></div>
               <div class="cp-dropzone">📎 Drop files to attach as intel</div>
             </div>
-            <div class="cp-chips" id="cp-chips"></div>
-            <div class="cp-attach-row">
-              <button type="button" class="btn small" data-attach="file" title="Attach text files (≤ 1 MB each)">📎 Files</button>
-              <button type="button" class="btn small" data-attach="folder" title="Give agents read-only access to a folder or file on this machine">📁 Folder / path</button>
-              <button type="button" class="btn small" data-attach="url" title="Fetch a web page as intel">🔗 URL</button>
-              <button type="button" class="btn small" data-attach="tools" title="MCP tools &amp; APIs from the LiteLLM gateway">🔌 Tools</button>
-              <button type="button" class="btn small" data-attach="knowledge" title="Link existing knowledge bases (vector stores) – agents can search them">📚 Knowledge</button>
-              <span class="hint"><kbd>#</kbd> attach · drop / paste files · <kbd>⌘</kbd><kbd>↵</kbd> deploy</span>
-              <input type="file" id="cp-file" multiple hidden>
-            </div>
-            <div class="cp-inline" id="cp-inline" hidden></div>
+            <section class="cp-context" aria-label="Context">
+              <header class="cp-ctx-head">
+                <h4>CONTEXT <em id="cp-ctx-count"></em></h4>
+                <span class="hint"><kbd>#</kbd> in the objective · drop files on it · <kbd>⌘</kbd><kbd>↵</kbd> deploy</span>
+                <button type="button" class="btn small primary" data-pick="" title="Repositories, knowledge, tools, files and web pages">＋ Add context</button>
+              </header>
+              <div class="cp-ctx-list" id="cp-ctx-list"></div>
+              <div class="cp-ctx-hint" id="cp-ctx-hint" hidden></div>
+            </section>
           </div>
           <aside class="cp-side">
             <h4>FORMATION</h4>
@@ -116,22 +137,21 @@
           <button class="btn primary" type="submit">⚔️ Deploy agents</button>
         </footer>
       </form>
+      <div id="context-picker" class="pk" hidden></div>
     </section>
     <div id="empty-hint">Press <kbd>N</kbd> or click <b>⚔️ New mission briefing</b> to deploy your first agents&nbsp;→</div>
   </section>
 
   <aside id="sidebar">
     <nav class="tabs">
-      <button class="tab active" data-tab="missions">⚔️ Missions</button>
-      <button class="tab" data-tab="reports">📑 Reports</button>
-      <button class="tab" data-tab="inspect">🔍 Unit</button>
-      <button class="tab" data-tab="agents" title="Agent profiles &amp; skills">🧬 Agents</button>
-      <button class="tab" data-tab="log">📜 Log</button>
-      <button class="tab" data-tab="allies">🤝 Allies</button>
-      <button class="tab" data-tab="trophies">🏅 <span id="trophy-count">0</span></button>
+      <button class="tab active" data-tab="missions" title="Running missions and the report archive">⚔️ Missions</button>
+      <button class="tab" data-tab="ops" title="Mission proposals from the operations team (read-only Outlook / Teams monitors)">📨 Inbox<em id="ops-count" class="tab-count" hidden></em></button>
+      <button class="tab" data-tab="teams" title="Saved teams – run on request or on a schedule (teams.yaml)">👥 Teams</button>
+      <button class="tab" data-tab="agents" title="Agent profiles, skills and allied A2A agents">🧬 Roster</button>
     </nav>
 
     <div class="tab-body" id="tab-missions">
+      <div class="seg" role="tablist"><button data-pane="missions" class="active">Active</button><button data-pane="reports">📑 Archive</button></div>
       <div class="panel quick">
         <button type="button" class="btn primary" id="open-composer">⚔️ New mission briefing <kbd>N</kbd></button>
         <div class="quick-row">
@@ -142,7 +162,16 @@
       <div id="mission-list"></div>
     </div>
 
+    <div class="tab-body" id="tab-ops" hidden>
+      <div id="ops-panel"></div>
+    </div>
+
+    <div class="tab-body" id="tab-teams" hidden>
+      <div id="teams-panel"></div>
+    </div>
+
     <div class="tab-body" id="tab-reports" hidden>
+      <div class="seg" role="tablist"><button data-pane="missions">Active</button><button data-pane="reports" class="active">📑 Archive</button></div>
       <p class="muted small">After-action reports: final deliverable, inputs, feedback rounds and every A2A artifact
         (who got which orders and delivered what).</p>
       <input id="report-search" placeholder="🔎 Search all deliverables &amp; artifacts…" autocomplete="off" spellcheck="false">
@@ -150,19 +179,13 @@
       <div id="report-list"></div>
     </div>
 
-    <div class="tab-body" id="tab-inspect" hidden>
-      <div id="inspector" class="panel"><p class="muted">Click a unit on the map to inspect it.</p></div>
-    </div>
-
     <div class="tab-body" id="tab-agents" hidden>
+      <div class="seg" role="tablist"><button data-pane="agents" class="active">Profiles &amp; skills</button><button data-pane="allies">🤝 Allies</button></div>
       <div id="profile-list"></div>
     </div>
 
-    <div class="tab-body" id="tab-log" hidden>
-      <div id="log"></div>
-    </div>
-
     <div class="tab-body" id="tab-allies" hidden>
+      <div class="seg" role="tablist"><button data-pane="agents">Profiles &amp; skills</button><button data-pane="allies" class="active">🤝 Allies</button></div>
       <form id="ally-form" class="panel">
         <h3>Recruit an A2A ally</h3>
         <p class="muted small">Any A2A agent URL – e.g. an agent behind LiteLLM's Agent Gateway
@@ -180,9 +203,14 @@
       <div id="ally-list"></div>
     </div>
 
-    <div class="tab-body" id="tab-trophies" hidden>
-      <div id="trophies" class="trophy-grid"></div>
-    </div>
+    <section id="unit-panel" hidden aria-label="Selected unit">
+      <header class="up-head">
+        <button type="button" class="btn ghost small" data-up="close" title="Back (Esc)">← Back</button>
+        <span class="up-title">🔍 UNIT</span>
+        <button type="button" class="btn ghost small" data-up="close" title="Close (Esc)">✕</button>
+      </header>
+      <div class="up-body"><div id="inspector" class="panel"></div></div>
+    </section>
   </aside>
 </main>
 

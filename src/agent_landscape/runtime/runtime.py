@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -27,11 +30,17 @@ from .events import EventBus
 from ..context.intel import ContextItem, MissionIntel, items_to_parts
 from ..context.intel import resolve as resolve_intel
 from ..context.mcp import MCPGateway
+from ..context.repos import MissionRepo, RepoError, RepoRegistry
+from ..context.repos import commit as repo_commit
+from ..context.repos import refresh_changes as repo_refresh
 from ..context.toolbox import Toolbox
-from ..context.vectorstore import HTTPBackend, MemoryBackend, StoreInfo, VectorService
+from ..context.vectorstore import HTTPBackend, MemoryBackend, StoreInfo, VectorService, parse_report, slug
+from ..ops.service import OpsService
 from ..storage.db import Database
+from ..teams.service import TeamService
 from .persistence import NullPersistence, Persistence
 from .regions import BIOMES, DOMAIN_BIOMES, Region, guess_biome
+from .reports import build_report, report_markdown
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +74,7 @@ class Topic:
     cost: float = 0.0
     context: list[dict[str, Any]] = field(default_factory=list)  # attached intel (summary, incl. errors)
     knowledge: list[dict[str, Any]] = field(default_factory=list)  # linked knowledge bases (vector stores)
+    team: str | None = None  # key of the team (teams.yaml) that runs this mission
     created_at: float = field(default_factory=time.time)
     finished_at: float | None = None
 
@@ -77,7 +87,7 @@ class Topic:
             "root_agent_id": self.root_agent_id, "task_id": self.task_id,
             "result": self.result, "rounds": self.rounds, "feedback": self.feedback,
             "tokens": self.tokens, "cost": round(self.cost, 6), "context": self.context,
-            "knowledge": self.knowledge,
+            "knowledge": self.knowledge, "team": self.team,
             "created_at": self.created_at, "finished_at": self.finished_at,
         }
 
@@ -114,9 +124,13 @@ class Runtime:
             backend, kind = None, "off"
         self.vectors = VectorService(backend, prefix=settings.vector_prefix,
                                      auto_archive=settings.vector_auto_archive, kind=kind)
+        self.archive_imported: set[str] = set()  # mission-archive files already in the vector store (path:hash)
         self.profiles = ProfileRegistry(settings.profiles_dir)
         self.skills = SkillRegistry(settings.skills_dirs)
+        self.repos = RepoRegistry(settings.repos_file, settings.workspace_dir, settings.context_roots)
         self.loop: asyncio.AbstractEventLoop | None = None
+        self.ops = OpsService(self)
+        self.teams = TeamService(self)
         self.persist: NullPersistence = (Persistence(self, Database(settings.db_path)) if settings.db_path
                                          else NullPersistence())
         self.tasks.listener = self.persist.task_id
@@ -140,7 +154,11 @@ class Runtime:
         restored = self.agents.get("commander")
         self.commander = restored if isinstance(restored, Commander) else self.spawn(  # type: ignore[assignment]
             Commander, topic_id=hq.id, parent=None, name="High Commander", depth=0, agent_id="commander")
+        self.ops.start()  # always-on operations team (read-only monitors) – not started by the Commander
         self.persist.start()
+        self.teams.start()  # scheduled team runs (teams.yaml)
+        if self.settings.mission_archive_dir and self.vectors.enabled:
+            self._spawn_background(self.import_mission_archive())
         self.model_problems = await self.llm.check_models()
         for problem in self.model_problems:
             log.warning(problem)
@@ -151,6 +169,8 @@ class Runtime:
         self.persist.freeze()
 
     async def stop(self) -> None:
+        await self.teams.stop()
+        await self.ops.stop()
         await self.persist.stop()
         for t in list(self._background):
             t.cancel()
@@ -203,18 +223,32 @@ class Runtime:
     async def attach_intel(self, topic: Topic, items: list[ContextItem]) -> MissionIntel:
         """Resolve attachments (sandboxed) and make them available to every agent of the mission."""
         assert self.http is not None
+        cur = self.intel.get(topic.id)
+
+        async def repo_hook(item: ContextItem) -> tuple[MissionRepo, str | None]:
+            existing = cur.repo(item.repo) if cur is not None and item.repo else None
+            if existing is not None:  # feedback round: same worktree, upgrade to editable if asked
+                if item.write and not existing.write:
+                    await self.repos.make_writable(existing, topic.title, topic.id)
+                return existing, None
+            spec = self.repos.get(item.repo)
+            if spec is None:
+                raise RepoError(f"Unknown repo '{item.repo}' – register it first (＋ Add context → Repositories in the briefing)")
+            self.log(f"📦 Checking out {spec.name} for '{topic.title}'…", topic_id=topic.id)
+            return await self.repos.create_worktree(spec, topic.id, topic.title, ref=item.ref, write=item.write)
+
         new = await resolve_intel(items, allowed_roots=self.settings.context_roots, http=self.http, mcp=self.mcp,
-                                  vectors=self.vectors)
+                                  vectors=self.vectors, repo_hook=repo_hook)
         for store in new.stores:
             self.vectors.link(topic.id, store)
             self.knowledge_changed(topic.id, store, by="you", how="attached", quiet=True)
-        cur = self.intel.get(topic.id)
         if cur is not None:  # feedback round with extra attachments → merge
             for d in new.docs.values():
                 cur.add_doc(d)
             cur.roots += [r for r in new.roots if r not in cur.roots]
             cur.tools += [t for t in new.tools if t.ref not in {x.ref for x in cur.tools}]
             cur.stores += [s for s in new.stores if s.id not in {x.id for x in cur.stores}]
+            cur.repos += [r for r in new.repos if r not in cur.repos]
             cur.summary += new.summary
             new = cur
         self.intel[topic.id] = new
@@ -238,6 +272,48 @@ class Runtime:
                                                      vectors=self.vectors, runtime=self, topic_id=topic_id)
         return tb
 
+    # -------------------------------------------------------------- repos
+    def repo_changed(self, topic_id: str, mr: MissionRepo, *, by: str | None = None, what: str = "") -> None:
+        """An agent changed / committed files in a mission repo → persist + live update."""
+        self.persist.intel(topic_id)
+        if what.startswith("Committed"):
+            self.log(f"📦 {by}: {what}", topic_id=topic_id, level="success")
+        self.emit("repo_changed", topic_id=topic_id, repo=mr.name, by=by, commits=len(mr.commits),
+                  changed=len(mr.changed))
+
+    async def finalize_repos(self, topic: "Topic") -> None:
+        """End of a mission round: commit leftovers on mission branches and summarise them in the log."""
+        intel = self.intel.get(topic.id)
+        for mr in (intel.repos if intel else []):
+            if not mr.write:
+                continue
+            try:
+                await repo_refresh(mr)
+                if mr.changed:
+                    out = await repo_commit(mr, f"chore: uncommitted changes from mission '{topic.title}'",
+                                            "Agent Landscape")
+                    if out.startswith("Committed"):
+                        self.log(f"📦 {mr.name}: auto-committed leftover changes", topic_id=topic.id)
+            except RepoError as exc:
+                self.log(f"📦 {mr.name}: {exc}", topic_id=topic.id, level="warn")
+            if mr.commits:
+                self.log(f"📦 {mr.name}: {len(mr.commits)} commit(s) on {mr.branch} – review & push in the report "
+                         "(📦 Code)", topic_id=topic.id, level="success")
+            self.repo_changed(topic.id, mr)
+
+    def _drop_worktrees(self, intel: MissionIntel | None) -> None:
+        if not intel or not intel.repos:
+            return
+
+        async def _go() -> None:
+            for mr in intel.repos:
+                with contextlib.suppress(Exception):
+                    await self.repos.remove_worktree(mr)
+
+        t = asyncio.create_task(_go())
+        self._background.add(t)
+        t.add_done_callback(self._background.discard)
+
     # ---------------------------------------------------------- knowledge
     def knowledge_changed(self, topic_id: str, store: StoreInfo, *, by: str | None = None, how: str | None = None,
                           quiet: bool = False) -> None:
@@ -251,7 +327,8 @@ class Runtime:
             topic.knowledge.append(entry)
             if not quiet:
                 verb = {"created": "created knowledge base", "linked": "linked knowledge base",
-                        "region": "linked region knowledge"}.get(how or "", "linked")
+                        "region": "linked region knowledge",
+                        "recall": "linked recalled knowledge"}.get(how or "", "linked")
                 self.log(f"📚 {by or 'HQ'} {verb} '{store.name}'", topic_id=topic_id, level="success")
         entry.update(files=store.files, bytes=store.bytes,
                      used_by=sorted(self.vectors.usage.get(store.id, set())))
@@ -271,22 +348,102 @@ class Runtime:
         if store is not None and store.files and self.vectors.link(topic.id, store):
             self.knowledge_changed(topic.id, store, by="Command HQ", how="region")
 
+    async def recall_past_missions(self, topic: Topic) -> list[dict[str, Any]]:
+        """Semantic search over every region archive for past missions related to a new mission."""
+        if not self.vectors.enabled or self.settings.vector_recall <= 0:
+            return []
+        try:
+            hits = await self.vectors.recall(f"{topic.title}\n{topic.goal}", limit=self.settings.vector_recall,
+                                             min_score=self.settings.vector_recall_min_score)
+        except Exception as exc:  # noqa: BLE001 – recall is optional, never block a mission
+            self.log(f"Recall of past missions failed: {exc}", topic_id=topic.id, level="warn")
+            return []
+        if hits:
+            self.log(f"🧠 Command HQ recalled {len(hits)} related past mission document(s) from "
+                     f"{len({h['store'].id for h in hits})} archive(s)", topic_id=topic.id)
+        return hits
+
+    def link_recalled_knowledge(self, topic: Topic, hits: list[dict[str, Any]]) -> None:
+        """Archives with recall hits (possibly from other regions) become searchable for the mission team."""
+        for h in hits:
+            store: StoreInfo = h["store"]
+            if self.vectors.link(topic.id, store):
+                self.knowledge_changed(topic.id, store, by="Command HQ", how="recall")
+
     def schedule_archive(self, topic: Topic) -> None:
-        """Archive a completed mission into its region knowledge base (background, best effort)."""
+        """Archive a completed mission (full mission report) into its region knowledge base (background)."""
         if not (self.vectors.enabled and self.vectors.auto_archive and topic.result):
             return
+        try:  # build now (event loop thread) – the tasks of this round are complete
+            report: str | None = report_markdown(build_report(self, topic))
+        except Exception:  # noqa: BLE001 – fall back to objective + deliverable
+            log.exception("Could not build the mission report for the archive")
+            report = None
 
         async def _go() -> None:
             try:
-                store = await self.vectors.archive(topic, self.regions.get(topic.region_id or ""))
+                store = await self.vectors.archive(topic, self.regions.get(topic.region_id or ""), report=report)
                 if store is not None:
                     self.log(f"📚 Archived '{topic.title}' into '{store.name}'", topic_id=topic.id, level="success")
             except Exception as exc:  # noqa: BLE001
                 self.log(f"Could not archive '{topic.title}': {exc}", topic_id=topic.id, level="warn")
 
-        t = asyncio.create_task(_go())
+        self._spawn_background(_go())
+
+    def _spawn_background(self, coro: Any) -> None:
+        t = asyncio.create_task(coro)
         self._background.add(t)
         t.add_done_callback(self._background.discard)
+
+    async def import_mission_archive(self, root: str | None = None) -> dict[str, Any]:
+        """Import exported mission reports (``mission-archive/**/*.md``) into the region knowledge stores, so
+        recall and region memory cover them. Regions are matched by the report's ``Region:`` line; files already
+        imported (same path + content) are skipped."""
+        out: dict[str, Any] = {"imported": 0, "skipped": 0, "unparsed": [], "stores": [], "errors": []}
+        base = Path(root or self.settings.mission_archive_dir or "")
+        if not self.vectors.enabled or not str(base) or not base.is_dir():
+            return out
+        persistent = self.vectors.kind == "http"  # the in-memory (mock) store is empty after every restart
+        groups: dict[str, tuple[str, list[tuple[str, str, str]]]] = {}
+        for f in sorted(base.rglob("*.md")):
+            try:
+                text = f.read_text(errors="replace")
+            except OSError as exc:
+                out["errors"].append(f"{f.name}: {exc}")
+                continue
+            _title, region_name = parse_report(text)
+            if not region_name:
+                out["unparsed"].append(str(f.relative_to(base)))
+                continue
+            rel = f.relative_to(base)
+            key = f"{rel}:{hashlib.sha1(text.encode()).hexdigest()[:12]}"
+            if persistent and key in self.archive_imported:
+                out["skipped"] += 1
+                continue
+            fname = f"archive-{'-'.join(slug(p, 30) for p in rel.parent.parts)}-{slug(f.stem, 50)}.md".replace("--", "-")
+            groups.setdefault(region_name.lower(), (region_name, []))[1].append((fname, text, key))
+        for lname, (name, docs) in groups.items():
+            region: Any = next((r for r in self.domain_regions() if r.name.lower() == lname), None) \
+                or SimpleNamespace(name=name, kind="domain", biome=None)  # store only – no new area on the map
+            try:
+                store = await self.vectors.region_store(region, create=True)
+                if store is None:
+                    continue
+                for i in range(0, len(docs), 20):
+                    await self.vectors.add(store, [(fn, text) for fn, text, _ in docs[i:i + 20]])
+            except Exception as exc:  # noqa: BLE001
+                out["errors"].append(f"{name}: {exc}")
+                continue
+            self.archive_imported.update(k for _, _, k in docs)
+            out["imported"] += len(docs)
+            out["stores"].append(store.name)
+        if out["imported"]:
+            self.persist.kv()
+            self.log(f"📚 Imported {out['imported']} archived mission report(s) into "
+                     f"{len(out['stores'])} region knowledge base(s)", level="success")
+        for err in out["errors"]:
+            self.log(f"Mission archive import: {err}", level="warn")
+        return out
 
     # ------------------------------------------------------------ regions
     def _create_region(self, name: str, description: str, biome: str, *, kind: str = "domain",
@@ -359,7 +516,7 @@ class Runtime:
             agent = self.agents.pop(aid)
             self.occupied.pop(agent.position, None)
         del self.topics[topic_id]
-        self.intel.pop(topic_id, None)
+        self._drop_worktrees(self.intel.pop(topic_id, None))  # mission branches with commits are kept
         self._toolboxes.pop(topic_id, None)
         self.vectors.links.pop(topic_id, None)
         for t in self.tasks.list(context_id=topic_id):
@@ -388,12 +545,26 @@ class Runtime:
     async def start_mission(self, goal: str, *, title: str | None = None, mode: str = "auto",
                             swarm_size: int | None = None, model: str | None = None,
                             region_id: str | None = None, context: list[ContextItem] | None = None,
-                            profile: str | None = None) -> Topic:
+                            profile: str | None = None, new_region: dict[str, str] | None = None,
+                            proposal_id: str | None = None, team: str | None = None) -> Topic:
         """Create a mission and hand it to the Commander via A2A (it surveys + places the territory).
 
-        Context travels A2A-natively: files as FileParts, references as a DataPart."""
+        Context travels A2A-natively: files as FileParts, references as a DataPart.
+        ``new_region`` charts a region first (approved operations proposal); ``proposal_id`` marks that
+        proposal as approved."""
         assert self.commander is not None
+        if new_region and not region_id:
+            existing = next((r for r in self.domain_regions()
+                             if r.name.lower() == str(new_region.get("name", "")).strip().lower()), None)
+            region_id = (existing or self.create_region(
+                str(new_region.get("name") or title or "New Frontier"), str(new_region.get("description") or goal),
+                str(new_region.get("biome") or ""))).id
         topic = self.create_topic(title or short(goal, 48), goal, mode)
+        if team:
+            topic.team = team
+            self.topic_changed(topic)
+        if proposal_id:
+            self.ops.approved(proposal_id, topic.id)
         md = {"topic_id": topic.id, "mode": topic.mode, "title": topic.title, "swarm_size": swarm_size,
               "model": model, "region_id": region_id if region_id in self.regions else None,
               "profile": profile if self.profiles.get(profile) else None}
@@ -632,4 +803,5 @@ class Runtime:
                 "vectors": self.vectors.kind,
                 "persistence": self.persist.info(),
             },
+            "ops": self.ops.snapshot(),
         }

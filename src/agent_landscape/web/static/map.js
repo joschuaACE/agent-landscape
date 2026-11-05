@@ -13,7 +13,7 @@ const EMOJI_FONT = '"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans
 export const ACTIVE = new Set(['working', 'thinking', 'delegating', 'waiting']);
 export const STATUS_COLORS = {
   idle: '#8a93a6', working: '#4fc3f7', thinking: '#b388ff', delegating: '#ffb74d',
-  waiting: '#ffd54f', done: '#66bb6a', failed: '#ef5350', canceled: '#78909c',
+  waiting: '#ffd54f', done: '#66bb6a', failed: '#ef5350', canceled: '#78909c', monitoring: '#26c6da',
 };
 const ROLE_STYLE = {
   commander: { base: '#f5c542', scale: 0.74 },
@@ -22,6 +22,8 @@ const ROLE_STYLE = {
   swarm_leader: { base: '#d98e22', scale: 0.58 },
   swarm_member: { base: '#cdb32e', scale: 0.4 },
   ally: { base: '#8e7cc3', scale: 0.58 },
+  ops_lead: { base: '#1f8f9e', scale: 0.62 },
+  monitor: { base: '#26a69a', scale: 0.52 },
 };
 const TOPIC_ICON = { active: '⚔️', completed: '🏆', failed: '💀', canceled: '🏳️', interrupted: '⏸️' };
 
@@ -75,6 +77,7 @@ export const BIOMES = {
 const LAND_R = 6; // region land reaches ~TERRITORY_RADIUS + 3 tiles around each of its territories
 const MIN_Z = 0.08; // strategic zoom: below STRATEGIC_Z only charted land is drawn (cheap, overview of all regions)
 const STRATEGIC_Z = 0.2;
+const MAX_DETAIL_CELLS = 3500; // above this many visible hexes the map also switches to the strategic view
 const hexDist = (aq, ar, bq, br) => (Math.abs(aq - bq) + Math.abs(ar - br) + Math.abs(aq + ar - bq - br)) / 2;
 const easeInOut = (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
 
@@ -93,15 +96,25 @@ function sprite(emoji) {
   }
   return c;
 }
+/** Emoji at font size ``size`` centred on (x, y) – color-emoji fillText costs ~1–3 ms each on macOS. */
+function drawEmoji(ctx, emoji, x, y, size) {
+  const s = (size * 64) / 50;
+  ctx.drawImage(sprite(emoji), x - s / 2, y - (s * 35) / 64, s, s);
+}
 function pickDeco(biome, q, r) {
   let h = hash(q * 7 + 11, r * 3 - 7), acc = 0;
   for (const [emoji, p] of biome.decos) { acc += p; if (h < acc) return emoji; }
   return null;
 }
 const placed = (t) => t && t.q !== null && t.q !== undefined;
+const FOG_CELL = Object.freeze({ fill: '#0a0f1c', deco: null, emoji: null, region: null }); // not yet computed (frame budget)
 
 export class HexMap {
-  constructor(canvas, minimap, store, { onSelect, onHover } = {}) {
+  constructor(canvas, minimap, store, { onSelect, onHover, isCovered, onBanner } = {}) {
+    this.onBanner = onBanner || (() => {});
+    this.isCovered = isCovered || (() => false); // a full-screen panel hides the map → don't paint it
+    this.lastDraw = 0;
+    this.dirty = true;
     this.c = canvas;
     this.ctx = canvas.getContext('2d');
     this.mm = minimap;
@@ -130,13 +143,28 @@ export class HexMap {
     this.resize();
     new ResizeObserver(() => this.resize()).observe(canvas.parentElement);
     this.bindInput();
+    for (const ev of ['pointermove', 'pointerdown', 'pointerup', 'wheel', 'pointerleave']) {
+      canvas.addEventListener(ev, () => { this.dirty = true; }, { passive: true });
+    }
     requestAnimationFrame((t) => this.frame(t));
+  }
+
+  /** Something on the map moves → paint every frame; otherwise ambient animation at ~15 fps. */
+  busy() {
+    const c = this.cam, t = this.tgt;
+    if (Math.abs(t.x - c.x) > 0.3 || Math.abs(t.y - c.y) > 0.3 || Math.abs(t.z - c.z) > 0.002) return true;
+    if (this.projectiles.length || this.particles.length || this.floaters.length || this.ripples.length || this.revealing.size) return true;
+    for (const a of this.store.agents.values()) if (ACTIVE.has(a.status)) return true;
+    return false;
   }
 
   // ------------------------------------------------------------ camera
   resize() {
     const r = this.c.parentElement.getBoundingClientRect();
-    this.dpr = window.devicePixelRatio || 1;
+    // pixel budget (~4.5 MP): a full Retina backing store makes every map frame expensive to raster,
+    // which shows up as presentation delay on clicks elsewhere (INP)
+    const budget = Math.sqrt(4.5e6 / Math.max(1, r.width * r.height));
+    this.dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, budget));
     this.w = r.width; this.h = r.height;
     this.c.width = Math.round(r.width * this.dpr);
     this.c.height = Math.round(r.height * this.dpr);
@@ -228,7 +256,7 @@ export class HexMap {
         if (hit) { this.select(hit.id); this.onSelect(hit.id); }
         else {
           const banner = this.hitBanner(sx, sy);
-          if (banner) this.focusTopic(banner);
+          if (banner) { this.focusTopic(banner); this.onBanner(banner); }
           else { this.select(null); this.onSelect(null); }
         }
       }
@@ -259,7 +287,7 @@ export class HexMap {
       });
     }
   }
-  select(id) { this.selectedId = id; }
+  select(id) { this.selectedId = id; this.dirty = true; }
   hitAgent(sx, sy) {
     const w = this.toWorld(sx, sy);
     let best = null, bd = Infinity;
@@ -320,7 +348,8 @@ export class HexMap {
     }
   }
   onTopicChanged(id) { this.territories.delete(id); this.refreshLand(); }
-  /** Rebuild the anchors that define region land; only resets the terrain cache if they changed. */
+  /** Rebuild the anchors that define region land. Only the cells around added / removed / re-biomed anchors
+   *  are dropped from the terrain cache – a full rebuild (~6k cells) in one frame caused 50-400 ms frames (INP). */
   refreshLand() {
     const anchors = [];
     for (const reg of this.store.regions.values()) anchors.push({ q: reg.q, r: reg.r, region: reg });
@@ -328,9 +357,20 @@ export class HexMap {
       const reg = placed(t) && this.store.regions.get(t.region_id);
       if (reg && (t.q !== reg.q || t.r !== reg.r)) anchors.push({ q: t.q, r: t.r, region: reg });
     }
-    const sig = anchors.map((a) => `${a.q},${a.r},${a.region.id},${a.region.biome}`).join('|');
     this.anchors = anchors;
-    if (sig !== this.anchorSig) { this.anchorSig = sig; this.terrain.clear(); }
+    const sigs = new Set(anchors.map((a) => `${a.q},${a.r},${a.region.id},${a.region.biome}`));
+    const old = this.anchorSigs || new Set();
+    this.anchorSigs = sigs;
+    const changed = [...sigs].filter((s) => !old.has(s)).concat([...old].filter((s) => !sigs.has(s)));
+    if (!changed.length) return;
+    if (!old.size || changed.length > 24) { this.terrain.clear(); return; }
+    const R = LAND_R + 2; // landRegion() never looks further than this
+    for (const s of changed) {
+      const [aq, ar] = s.split(',').map(Number);
+      for (let dq = -R; dq <= R; dq++) {
+        for (let dr = Math.max(-R, -dq - R); dr <= Math.min(R, -dq + R); dr++) this.terrain.delete(key(aq + dq, ar + dr));
+      }
+    }
   }
   onRegionCreated(region) {
     this.refreshLand();
@@ -410,6 +450,10 @@ export class HexMap {
     const k = key(q, r);
     let t = this.terrain.get(k);
     if (!t) {
+      // at most ~6 ms of new cells per frame (load, zoom-in, fly-to): the rest shows as fog and fills in over
+      // the next frames instead of one 50-400 ms frame that blocks clicks (INP)
+      if (!this.terrainOver && (++this.terrainMisses & 31) === 0 && performance.now() > this.terrainDeadline) this.terrainOver = true;
+      if (this.terrainOver) { this.dirty = true; return FOG_CELL; }
       const j = Math.floor(hash(q * 7 + 3, r * 13 + 1) * 3);
       const region = this.landRegion(q, r);
       if (region) {
@@ -464,7 +508,19 @@ export class HexMap {
   }
 
   // ------------------------------------------------------------- frame
+  /** The UI next to the map needs the next frame(s) – skip map painting meanwhile (INP). */
+  yieldTo(ms = 160) { this.pauseUntil = performance.now() + ms; }
+
   frame(ts) {
+    requestAnimationFrame((t) => this.frame(t));
+    // Painting a full-screen Retina canvas every frame delays clicks / typing in the panels (INP).
+    if (this.isCovered() || ts < (this.pauseUntil || 0)) { this.last = ts; this.dirty = true; return; }
+    if (!this.dirty && ts - this.lastDraw < 66 && !this.busy()) return;
+    this.dirty = false;
+    this.lastDraw = ts;
+    this.terrainDeadline = performance.now() + 6;
+    this.terrainMisses = 0;
+    this.terrainOver = false;
     const now = ts;
     const dt = Math.min(0.05, (now - this.last) / 1000);
     this.last = now;
@@ -497,7 +553,6 @@ export class HexMap {
     this.drawLabels(now);
     this.drawFloaters(now);
     if (this.frameNo % 3 === 0) this.drawMinimap();
-    requestAnimationFrame((t) => this.frame(t));
   }
 
   /** Far zoom: skip the wilderness, draw only charted region land (≈130 cells per territory). */
@@ -534,8 +589,11 @@ export class HexMap {
 
   drawTerrain(now) {
     const { ctx } = this;
-    if (this.cam.z < STRATEGIC_Z) { this.drawStrategicTerrain(); return; }
     const tl = this.toWorld(0, 0), br = this.toWorld(this.w, this.h);
+    // strategic view by zoom *or* by visible cell count: on big / Retina windows the full wilderness at
+    // z≈0.2-0.3 is ~8k hexes (30-140 ms per frame → INP); charted land alone is a fraction of that
+    const visibleCells = ((br.x - tl.x) * (br.y - tl.y)) / (HEX * HEX * 1.5 * SQ3);
+    if (this.cam.z < STRATEGIC_Z || visibleCells > MAX_DETAIL_CELLS) { this.drawStrategicTerrain(); return; }
     const r0 = Math.floor(tl.y / (HEX * 1.5)) - 1, r1 = Math.ceil(br.y / (HEX * 1.5)) + 1;
     const buckets = new Map();
     const decos = [];
@@ -806,6 +864,23 @@ export class HexMap {
         ctx.strokeStyle = sc;
         ctx.arc(p.x, p.y, R + ctx.lineWidth * 1.4, -Math.PI / 2, -Math.PI / 2 + k * Math.PI * 2);
         ctx.stroke();
+      } else if (a.status === 'monitoring') { // always-on listener: radar sweep + slow sonar ping
+        const rr = R + ctx.lineWidth * 1.4;
+        const rot = now / 900 + strHash(a.id) * 6.28;
+        ctx.strokeStyle = rgba(sc, 0.35);
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, rr, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.strokeStyle = sc;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, rr, rot, rot + 0.9);
+        ctx.stroke();
+        const k = ((now + strHash(a.id) * 3000) % 3000) / 3000;
+        ctx.strokeStyle = rgba(sc, 0.45 * (1 - k));
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, rr + k * R * 1.3, 0, Math.PI * 2);
+        ctx.stroke();
       } else if (a.status !== 'idle') {
         ctx.beginPath();
         ctx.strokeStyle = sc;
@@ -814,11 +889,10 @@ export class HexMap {
       }
 
       // icon
-      ctx.font = `${Math.round(R * 1.05)}px ${EMOJI_FONT}`;
+      drawEmoji(ctx, a.icon || '🤖', p.x, p.y + R * 0.06, R * 1.05);
+      ctx.globalAlpha = 1;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillText(a.icon || '🤖', p.x, p.y + R * 0.06);
-      ctx.globalAlpha = 1;
 
       // level badge
       if (z > 0.45 && a.role !== 'swarm_member') {
@@ -837,10 +911,7 @@ export class HexMap {
       // status badge
       const badge = a.status === 'done' && !a.persistent ? '✅' : a.status === 'failed' ? '❌'
         : a.status === 'waiting' ? '⏳' : a.status === 'canceled' ? '🏳️' : null;
-      if (badge) {
-        ctx.font = `${Math.round(R * 0.55)}px ${EMOJI_FONT}`;
-        ctx.fillText(badge, p.x + R * 0.8, p.y - R * 0.75);
-      }
+      if (badge) drawEmoji(ctx, badge, p.x + R * 0.8, p.y - R * 0.75, R * 0.55);
       // veteran medal (served ≥ 2 tasks – reusable unit with a service record)
       if (a.veteran && z > 0.45) {
         const s = Math.max(12, R * 0.62);
@@ -892,10 +963,7 @@ export class HexMap {
       ctx.fill();
       if (this.cam.z > 0.6) {
         ctx.globalCompositeOperation = 'source-over';
-        ctx.font = `16px ${EMOJI_FONT}`;
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(pr.kind === 'request' ? '📜' : pr.kind === 'error' ? '💥' : '✉️', hx, hy - 1);
+        drawEmoji(ctx, pr.kind === 'request' ? '📜' : pr.kind === 'error' ? '💥' : '✉️', hx, hy - 1, 16);
         ctx.globalCompositeOperation = 'lighter';
       }
     }
@@ -1001,7 +1069,8 @@ export class HexMap {
       const s = this.toScreen(c.x, c.y - HEX * 1.5 * (topic.radius + 0.85));
       if (s.x < -200 || s.x > this.w + 200 || s.y < -60 || s.y > this.h + 60) continue;
       const agents = [...this.store.agents.values()].filter((a) => a.topic_id === topic.id);
-      const icon = topic.kind === 'hq' ? '👑' : topic.kind === 'allies' ? '🤝' : TOPIC_ICON[topic.status] || '⚔️';
+      const icon = topic.kind === 'hq' ? '👑' : topic.kind === 'allies' ? '🤝' : topic.kind === 'ops' ? '📡'
+        : TOPIC_ICON[topic.status] || '⚔️';
       const title = topic.title.length > 30 ? `${topic.title.slice(0, 29)}…` : topic.title;
       ctx.font = '700 13px Cinzel, Georgia, serif';
       const tw = ctx.measureText(title).width;
@@ -1021,8 +1090,7 @@ export class HexMap {
 
       ctx.textBaseline = 'middle';
       ctx.textAlign = 'left';
-      ctx.font = `15px ${EMOJI_FONT}`;
-      ctx.fillText(icon, x + 10, y + 15);
+      drawEmoji(ctx, icon, x + 19, y + 15, 15);
       ctx.font = '700 13px Cinzel, Georgia, serif';
       ctx.fillStyle = '#f8e6a8';
       ctx.fillText(title, x + 32, y + 15);
@@ -1051,6 +1119,25 @@ export class HexMap {
           ctx.fillStyle = g;
           ctx.fillRect(sx - 20, by, 40, 5);
           ctx.restore();
+        }
+      }
+      if (topic.kind === 'ops') { // proposals waiting for the human → pulsing badge on the banner
+        const n = (this.store.ops?.proposals || []).filter((p) => p.status === 'pending').length;
+        if (n) {
+          const label = `📨 ${n}`;
+          ctx.font = '700 12px Inter, sans-serif';
+          const bw = ctx.measureText(label).width + 16, bx = x + w - bw / 2 - 4, by = y - 10;
+          const pulse = 0.6 + 0.4 * Math.sin(now / 300);
+          this.roundRect(bx, by, bw, 20, 10);
+          ctx.fillStyle = `rgba(239,83,80,${0.75 + 0.25 * pulse})`;
+          ctx.fill();
+          ctx.strokeStyle = '#fff';
+          ctx.lineWidth = 1;
+          ctx.stroke();
+          ctx.fillStyle = '#fff';
+          ctx.textAlign = 'center';
+          ctx.fillText(label, bx + bw / 2, by + 10.5);
+          ctx.textAlign = 'left';
         }
       }
       this.bannerRects.push({ id: topic.id, x, y, w, h });

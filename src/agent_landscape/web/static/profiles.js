@@ -2,12 +2,14 @@
 import { renderMarkdown } from './md.js';
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const KIND_LABEL = { orchestrator: '🏰 Orchestrators', worker: '🧑‍🔧 Specialists', swarm_leader: '🌀 Hive leaders', swarm_member: '🐝 Swarm personas' };
+const KIND_LABEL = { orchestrator: '🏰 Orchestrators', worker: '🧑‍🔧 Specialists', swarm_leader: '🌀 Hive leaders', swarm_member: '🐝 Swarm personas', ops_lead: '📡 Operations leads', monitor: '👂 Channel monitors' };
 const KIND_HINT = {
   orchestrator: 'Plans missions and merges results. Edit the persona, the plan template ({max_subtasks}) and the synthesis prompt.',
   worker: 'Executes subtasks. Orchestrators pick specialists by their description – keep it short and specific.',
   swarm_leader: 'Releases a swarm and builds the consensus.',
   swarm_member: 'One perspective in a swarm. A hive picks personas at random.',
+  ops_lead: 'Always-on lead of the operations team: turns monitor signals into an intel note for the Commander. Read-only, no tools.',
+  monitor: 'Always-on, read-only watcher of one channel (key <code>&lt;channel&gt;-monitor</code>). The instructions define what counts as relevant. No tools.',
 };
 const SOURCE = { builtin: ['built-in', ''], override: ['override', 'warn'], repo: ['custom', 'ok'] };
 
@@ -145,6 +147,7 @@ export function createProfiles({ listEl, viewEl, store, api, toast }) {
           <select name="model"><option value="">inherit (mission / default)</option>
             ${[...new Set([...(models || []), ...(p.model ? [p.model] : [])])].map((m) => `<option ${m === p.model ? 'selected' : ''}>${esc(m)}</option>`).join('')}</select>
           <label class="slider" title="Empty = default">Temperature <input type="number" name="temperature" min="0" max="2" step="0.1" value="${p.temperature ?? ''}" placeholder="0.7" style="width:70px;margin:0"></label>
+          <label class="slider" title="Tool-call rounds per answer – empty = MAX_TOOL_STEPS">Tool steps <input type="number" name="max_tool_steps" min="1" max="40" step="1" value="${p.max_tool_steps ?? ''}" placeholder="default" style="width:70px;margin:0"></label>
           <h4>TOOL ACCESS</h4>
           ${Object.entries(fam).map(([k, d]) => `<label class="pf-check" title="${esc(d)}"><input type="checkbox" name="tools" value="${k}" ${p.tools.includes(k) ? 'checked' : ''}>
             <span><b>${k}</b><small>${esc(d)}</small></span></label>`).join('')}
@@ -189,11 +192,13 @@ export function createProfiles({ listEl, viewEl, store, api, toast }) {
     if (fd.has('p_plan') && fd.get('p_plan').trim()) prompts.plan = fd.get('p_plan').trim();
     if (fd.has('p_synthesize') && fd.get('p_synthesize').trim()) prompts.synthesize = fd.get('p_synthesize').trim();
     const temp = String(fd.get('temperature') || '').trim();
+    const steps = String(fd.get('max_tool_steps') || '').trim();
     return {
       key: String(fd.get('key') || p.key).trim(), kind: editing.isNew ? fd.get('kind') : p.kind,
       title: String(fd.get('title')).trim(), icon: String(fd.get('icon') || '🤖').trim(),
       description: String(fd.get('description') || '').trim(), prompt: String(fd.get('prompt') || '').trim(),
       model: fd.get('model') || null, temperature: temp === '' ? null : Number(temp),
+      max_tool_steps: steps === '' ? null : Number(steps),
       tools: fd.getAll('tools'), grant_mcp: fd.getAll('grant_mcp'),
       skills: mode === 'all' ? ['*'] : mode === 'none' ? [] : fd.getAll('skills'),
       prompts, enabled: fd.get('enabled') === 'on',

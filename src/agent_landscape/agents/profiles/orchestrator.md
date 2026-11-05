@@ -4,7 +4,7 @@ kind: orchestrator
 title: Orchestrator
 icon: 🏰
 description: Plans a mission, assigns specialists, swarms and sub-orchestrators, and merges the results.
-tools: [intel, files, knowledge, knowledge_admin, mcp, skills]
+tools: [intel, files, knowledge, knowledge_admin, mcp, skills, repo]
 skills: ["*"]
 prompts:
   plan: |-

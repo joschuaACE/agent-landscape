@@ -1,0 +1,156 @@
+I want to have a better View of the Deliverables, f.e. maybe a new tab with mission report, input and output artifacts.
+
+
+Also giving missions is a small text box on the sidebar, how can we improve the UI for that?
+Also can we give here also context for the agents? f.e. files, or directory paths, mcp tools, even apis to call f.e. a Vector database?
+F.e. using the chat of the Github CoPilot VS Code Extension as an example. here i. can attach files, reference directories, or call APIs directly from the chat interface. Would this be a good idea or how can we make it work for us?
+
+
+Mission complete, would also be nice to give the user a more detailed view of the mission, including its status, assigned agents, and related artifacts.
+So i can track what agents, roles, special instructions, and actions were involved in completing the mission and which one work and which dont
+
+mcp server, lists tools via the registr of litellm 
+
+
+Orchestrator Agents should have access to vector stores
+http://localhost:8000/openapi.json
+If needed, create vector stores so the sub agents, etc. can access it.
+Stores names should be unique and descriptive for easy identification that an agent for a specific purpose is using them.
+
+VECTOR_STORE_URL=http://localhost:8000
+VECTOR_STORE_KEY=sk-vector-store
+
+Question ... Should it done be via the API or should i create a new mcp for that?
+
+For each sub agent, etc. i want to be able to configure a default or new set of system instructions, prompts and tool access
+Right now its done via roles.py right?
+Can we access skills also from this repo directory or even skills configured on litellm?
+
+  → DONE: agent profiles (Markdown, profiles/ overrides built-ins, 🧬 Agents tab editor, tool families enforced, lead profile per mission)
+    + repo skills (skills/, .github/skills, .claude/skills via use_skill). LiteLLM /v1/skills = metadata only → not usable.
+  LATER – profiles: per-mission specialist overrides, profile A/B stats (success per rev), sync repo skills → LiteLLM,
+    "write" MCP tools grantable with human approval, teams = saved sets of profiles (→ teams + schedules idea below)
+
+For Coding Tasks like CoPilot Studio: git repos selectable in the mission briefing; Commander checks out, orchestrator researches + plans
+  → DONE: repos.yaml registry (URL clone or local checkout, keywords → 💡 suggestions), per-mission git worktree,
+    👁 read-only or ✍️ editable branch agents/<mission>, repo / repo_write tool families (Engineer edits + commits),
+    report 📦 Code tab (commits, diff, Open in VS Code, ⬆️ Push = human only)
+  LATER – repos: open PR via API (GitHub / Azure DevOps), run tests/linters in the worktree (sandboxed "run_check" tool),
+    Copilot Studio skill (topic YAML conventions, pac CLI pack/validate), per-profile max_tool_steps for longer coding loops,
+    repo → region mapping (B.Braun repo auto-suggested in the B.Braun region), team 4.x "maintain agent-landscape" uses the registered repo
+
+===STATUS===
+
+Mlflow Tracing
+
+
+
+---
+
+In addition i want to have a pre select list of dedicated teams, and also like a schedule job when to deploy them. for example:
+- 1 Area: Project Akqusistion
+- Team 1.1: Customer Research, can do reserach for tasks, etc.
+
+- 2 Area: Architects
+- Team 2.1: Research design principlese, ai and software patterns
+- Team 2.2: Draw excalidraw diagrams with design guides, etc.
+
+- 3 Area: Coding
+- Team 3.1: Get Skills, etc. for CoPilot Studiom etc.
+- Team 3.2: Get Repo Code, Actions, Test, etc.
+
+- 4 Area: Maintining This Plattform
+- Team 4.1: Check for Dead code in `agent-landscape` and unnecessary tests
+- Team 4.2: Check for Test coverage `agent-landscape` and suggest new tests
+- Team 4.3: Implement Suggested test 
+- -> This whole team should run every day at 12pm lunch break
+
+  → PLANNED: 🔧 Lifecycle team (persistent team like OpsService, topic kind "lifecycle", repo = agent-landscape)
+    Profiles (profiles/*.md): code-janitor (dead code + useless tests, read-only), coverage-scout (coverage gaps → test proposals),
+      integrator (engineer-like, repo_write, implements approved tests/code), feature-steward (lead: idea → feedback cycles →
+      spec + acceptance criteria → delegates → reviews progress → maturity rating idea/prototype/usable/hardened)
+    Daily run (12:00): janitor + scout → findings as proposals (existing Proposal/approve flow) → approved → integrator on branch agents/lifecycle-<date>
+    Feature requests: prompted directly in a 🔧 Lifecycle tab, multi-round via send_followup on the same team
+    Needs: Scheduler (asyncio loop, cron-ish "daily 12:00 Mon-Fri", DB migration "schedules", catch-up after restart, run-now button),
+      sandboxed run_check tool (pytest / pytest --cov / vulture / ruff in the mission worktree, allow-list, timeout),
+      goal loop (feature-steward re-plans until acceptance criteria pass or max rounds), Proposals/Ops UI (doesn't exist yet)
+  → DONE (step 1+2): run_check tool (context/checks.py, family "checks": tests/coverage/lint/dead_code, allow-list, no shell,
+    secrets blanked + MOCK_LLM=1, timeout, history on MissionRepo.checks), profiles code-janitor / coverage-scout / integrator /
+    feature-steward (profiles/), skill agent-landscape-maintenance, per-profile max_tool_steps, pyproject extra [checks] + ruff config
+    Try now: mission with repo agent-landscape (👁 read-only) + lead "orchestrator", goal "code-janitor + coverage-scout review";
+    feature: lead profile "feature-steward" + repo ✍️ editable → answer its questions via feedback → "go"
+  → DONE (step 3+4+6-lite): teams.yaml (lead, members, repos, standing orders, cron schedule, region) + teams/ (cron.py,
+    service.py: scheduler loop 20s, catch-up ≤12h after downtime, skip while previous run active, pause/resume, history in DB),
+    team missions only use their members, 👥 Teams tab (run now / deploy with prompt, ⏰ next run, runs, 🔩 Implement F1,F3 =
+    approval → feedback round with repo upgraded to editable). Teams: lifecycle-daily (Mon–Fri 12:00), lifecycle-features,
+    customer-research, design-principles
+  NEXT: goal loop (5: steward re-plans until acceptance criteria pass, max rounds), proposal inbox for findings across runs,
+    more teams (2.2 excalidraw diagrams, 3.1 Copilot Studio skills, 3.2 repo code/actions) + their profiles, team editor in UI
+  NOTE: worktrees branch from the last *commit* – commit local work before a lifecycle run, else agents see old code
+  KNOWN: test_knowledge_bases_end_to_end flaky under coverage (recall text truncated) – first janitor/scout target
+  LATER – lifecycle: GitHub MCP tooling (via LiteLLM MCP registry) on the default repo https://github.com/joschuaACE/agent-landscape
+    → create branches/PRs, PR description from mission report, read CI (Actions) status + review comments, open issues for findings;
+    write tools (create PR, comment) only with human approval; push/merge stays human
+
+---
+
+knoweldge graph via Jev/Kev
+
+---
+
+litellm model overview? with configure of temperature, max tokens, thinking complexity?
+  → DONE (per agent): 🔍 Unit panel model dropdown → pinned model (PATCH /api/agents/{id}), wins over mission/profile/default,
+    survives re-deployment + restart; shows where the current model comes from (mission / profile / default)
+  LATER: pin applies to the Commander's survey/proposal calls (still ORCHESTRATOR_MODEL), "apply to team" checkbox,
+    temperature / max tokens / reasoning effort per agent + profile, model overview page (/v1/model/info: price, context window)
+
+---
+
+...
+persistent memory if server restarts? Chat history? how? db? local file db first?
+  → DONE (foundation): SQLite data/landscape.db – restore on restart, interrupted → Resume, FTS search
+  LATER – persistence:
+  - reports for very old missions: read tasks from the DB instead of memory (memory keeps the newest 5000 tasks)
+  - retention / cleanup policy (e.g. archive or delete missions older than N days), DB size in the UI
+  - backup/export button (copy of the .db + Markdown reports), import of mission-archive/
+  - achievements + rank are still browser-only (localStorage) → move to the DB
+  - attachments: dedupe by content hash, blob folder for binaries (PDF/images) once supported
+  - ally API keys are stored in the local DB → move to keychain / .env references
+  - event log table → replay the map as a time-lapse
+  - tables for the next features: teams + schedules, agent profiles (prompts/tools), human-feedback inbox, chat history
+  - multi-user / server deployment → Postgres (only storage/db.py speaks SQL)
+...
+/goal like anthropic to interate until the orchestrator reaches a satisfactory solution
+...
+Ai to Human Feedback, i want orchestrators to collect complaints from sub agents or their own issues, which then should be fixed by the human
+...
+VSCode integration to chat, spawn, etc...
+...
+Local Modl support and Re Training
+...
+gamification, f.e. clicking a lot on sub agents or orchestrators results in them to a "Anwser now" mode
+...
+ui like more ore, 8 bit, retro?
+...
+Watching Teams and Mail incoming messages, then reporiting to the Commander if relevant events occur, which then can suggest missions which need human approval.
+...
+on a mission report, its nice to have a static markown, but clickin on stuff, editing it or moving it would be nice. also if f.e. its an instruction to write code, the code snippet of the agnet doesnt work and i the can ask feedback if the snippet is wronng or my doing
+making it more interactive, also like a table of content on the side would be nice and custom seach function to seach for stuff more efficiently
+...
+
+
+---
+
+xxx
+BUGS
+
+Discover from agent URL
+Using the connection details you entered above. We'll fetch:
+
+http://localhost:8765/a2a/commander/.well-known/agent-card.json
+Discovery failed
+{"detail":"Could not fetch agent card from http://localhost:8765/a2a/commander (mode=well_known_fallback). Last error: http://localhost:8765/a2a/commander/agent.json: Cannot connect to host ::1:8765 ssl:<ssl.SSLContext object at 0x118c26450> [Connect call failed ('::1', 8765, 0, 0)]"}
+
+---
+
+We have a CoPilot Studio Agent, which is specialized on Meeting Transcriptions. Create a topic for getting a meeting transcription. It should check your outlook meetings, filter for the latest 3 meetings, then present the user via chat the meetings, he has to pick one, then get the technical meeting-id, list all the transcripts of the meeting, then iterate through it all and give all concatenaded as an output

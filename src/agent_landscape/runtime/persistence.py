@@ -125,7 +125,7 @@ class Persistence(NullPersistence):
             "cost": a.cost, "xp": a.xp, "tasks_done": a.tasks_done, "last_input": a.last_input,
             "last_output": a.last_output, "objective": a.objective, "memory": a.memory,
             "recruitments": a.recruitments, "position": list(a.position), "created_at": a.created_at,
-            "profile": a.profile_key,
+            "profile": a.profile_key, "pinned_model": a.pinned_model,
             "updated_at": a.updated_at, "extra": extra,
         }
 
@@ -171,6 +171,7 @@ class Persistence(NullPersistence):
             b["intel"].append((tid, _dumps({"roots": [str(p) for p in intel.roots],
                                             "tools": [asdict(t) for t in intel.tools],
                                             "stores": [asdict(s) for s in intel.stores],
+                                            "repos": [r.to_dict() for r in intel.repos],
                                             "summary": intel.summary})))
             b["docs"][tid] = [(d.name, d.source, d.origin, d.text) for d in intel.docs.values()]
         for tid in self._links:
@@ -181,6 +182,9 @@ class Persistence(NullPersistence):
                 ("counters", _dumps({"territory_index": rt._territory_index, "region_index": rt._region_index,
                                      "callsign": rt._callsign})),
                 ("kb_usage", _dumps({k: sorted(v) for k, v in rt.vectors.usage.items()})),
+                ("ops", _dumps(rt.ops.dump())),
+                ("teams", _dumps(rt.teams.dump())),
+                ("archive_imported", _dumps(sorted(rt.archive_imported))),
             ]
         for s in (self._agents, self._topics, self._regions, self._tasks, self._intel, self._links, self._deleted):
             s.clear()
@@ -230,6 +234,7 @@ class Persistence(NullPersistence):
         from ..agents.base import ACTIVE_STATES
         from ..context.intel import Doc, MissionIntel
         from ..context.mcp import MCPTool
+        from ..context.repos import MissionRepo
         from ..context.vectorstore import StoreInfo
         from .regions import Region
         from .runtime import Topic
@@ -274,10 +279,14 @@ class Persistence(NullPersistence):
             rt.intel[tid] = MissionIntel(
                 docs=docs, roots=[Path(p) for p in d.get("roots", []) if Path(p).exists()],
                 tools=[MCPTool(**t) for t in d.get("tools", [])],
-                stores=[StoreInfo(**s) for s in d.get("stores", [])], summary=d.get("summary", []))
+                stores=[StoreInfo(**s) for s in d.get("stores", [])], summary=d.get("summary", []),
+                repos=[MissionRepo.from_dict(r) for r in d.get("repos", []) if Path(r.get("path", "")).exists()])
         for tid, rows in data["links"].items():
             rt.vectors.links[tid] = {sid: StoreInfo(**s) for sid, s in rows}
         rt.vectors.usage = {k: set(v) for k, v in (kv.get("kb_usage") or {}).items()}
+        rt.ops.restore(kv.get("ops"))
+        rt.teams.restore(kv.get("teams"))
+        rt.archive_imported = set(kv.get("archive_imported") or [])
 
         interrupted = self._interrupt(ACTIVE_STATES)
         self.stats["restored"] = {"regions": len(rt.regions), "missions": sum(t.kind == "mission" for t in rt.topics.values()),
@@ -288,9 +297,11 @@ class Persistence(NullPersistence):
 
     def _build_agent(self, d: dict[str, Any]) -> Any:
         from ..a2a.types import AgentCard
+        from ..agents.ops import ChannelMonitor, CommsLead
         from ..agents.units import Commander, Orchestrator, RemoteAgent, SwarmLeader, SwarmMember, Worker
 
-        classes = {c.__name__: c for c in (Commander, Orchestrator, Worker, SwarmLeader, SwarmMember, RemoteAgent)}
+        classes = {c.__name__: c for c in (Commander, Orchestrator, Worker, SwarmLeader, SwarmMember, RemoteAgent,
+                                           ChannelMonitor, CommsLead)}
         cls = classes[d["cls"]]
         extra = d.get("extra") or {}
         kw: dict[str, Any] = dict(name=d["name"], topic_id=d["topic_id"], parent_id=d.get("parent_id"),
@@ -307,7 +318,8 @@ class Persistence(NullPersistence):
         if d.get("profile") and self.rt.profiles.get(d["profile"]) is not None:
             a.profile_key = d["profile"]
         for key in ("children", "status", "activity", "tokens", "cost", "xp", "tasks_done", "last_input",
-                    "last_output", "objective", "memory", "recruitments", "created_at", "updated_at"):
+                    "last_output", "objective", "memory", "recruitments", "created_at", "updated_at",
+                    "pinned_model"):
             if key in d:
                 setattr(a, key, d[key])
         a.position = tuple(d.get("position") or (0, 0))
