@@ -301,11 +301,14 @@ function scheduleRender() {
   renderQueued = true;
   requestAnimationFrame(() => {
     renderQueued = false;
-    renderMissions();
-    renderRegionSelect();
-    renderInspector();
-    renderAllies();
-    renderReportList();
+    // live events arrive many times per second – only rebuild what is visible (style/layout cost → INP);
+    // switchTab() / select() re-render the pane that becomes visible
+    const shown = (id) => !$(id).hidden;
+    if (shown('#tab-missions')) renderMissions();
+    renderRegionSelect(); // cheap (signature check) and the composer may open any moment
+    if (shown('#unit-panel') || !store.selected) renderInspector();
+    if (shown('#tab-allies')) renderAllies();
+    if (shown('#tab-reports')) renderReportList();
     renderOps();
     $('#empty-hint').hidden = [...store.topics.values()].some((t) => t.kind === 'mission');
   });
@@ -608,6 +611,7 @@ $('#ally-list').addEventListener('click', (e) => {
 });
 
 function select(id) {
+  if (id !== store.selected) map.yieldTo(100); // the unit panel slides in first, then the map repaints (INP)
   store.selected = id;
   map.select(id);
   $('#unit-panel').hidden = !id;
@@ -787,6 +791,7 @@ function switchTab(pane) {
   if (pane === 'agents') profiles.load();
   if (pane === 'ops') ops.render();
   if (pane === 'teams') teams.load();
+  scheduleRender();
 }
 document.querySelectorAll('.tab').forEach((t) => t.addEventListener('click', () => {
   if (store.selected) { store.selected = null; map.select(null); }
@@ -796,12 +801,14 @@ $('#sidebar').addEventListener('click', (e) => {
   const seg = e.target.closest('.seg [data-pane]');
   if (seg) switchTab(seg.dataset.pane);
 });
+const MAP_KEYS = new Set(['+', '=', '-', 'f']);
 // clicks / typing anywhere outside the map (sidebar, HUD popovers, log dock, overlays): let the UI's next
 // frame paint before the (expensive) map frame – INP. Map / minimap input keeps the map painting.
 for (const ev of ['pointerdown', 'keydown']) {
   document.addEventListener(ev, (e) => {
     // map shortcuts (+ / - / f on <body>) must keep painting, even with key repeat
-    if (e.target === document.body || e.target.closest?.('#map, #minimap')) return;
+    if (e.target === document.body && MAP_KEYS.has(e.key)) return;
+    if (e.target.closest?.('#map, #minimap')) return;
     map.yieldTo();
   }, { capture: true, passive: true });
 }
