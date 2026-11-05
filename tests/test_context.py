@@ -9,7 +9,7 @@ import pytest
 from agent_landscape.a2a.types import DataPart, FilePart, Message, TextPart
 from agent_landscape.context import sandbox
 from agent_landscape.context.intel import ContextItem, Doc, MissionIntel, items_from_message, items_to_parts
-from agent_landscape.context.mcp import MCPGateway
+from agent_landscape.context.mcp import MCPGateway, is_write_tool
 from agent_landscape.context.toolbox import Toolbox
 from agent_landscape.config import Settings
 
@@ -24,6 +24,23 @@ def repo(tmp_path):
     (tmp_path / "node_modules" / "x.js").write_text("NEEDLE in node_modules")
     (tmp_path / "logo.bin").write_bytes(b"\x00\x01binary")
     return tmp_path
+
+
+@pytest.mark.parametrize("name,write", [
+    ("get_commit", False), ("list_issues", False), ("pull_request_read", False), ("issue_read", False),
+    ("search_code", False), ("ui_get", False), ("vault_read", False), ("tavily_search", False),
+    ("add_issue_comment", True), ("assign_copilot_to_issue", True), ("fork_repository", True),
+    ("request_copilot_review", True), ("create_pull_request", True), ("merge_pull_request", True),
+    ("push_files", True), ("issue_write", True), ("vault_delete", True), ("command_execute", True),
+])
+def test_mcp_write_tool_heuristic(name, write):
+    assert is_write_tool(name) is write
+
+
+def test_mcp_write_tool_annotations_win():
+    assert is_write_tool("add_note", {"readOnlyHint": True}) is False
+    assert is_write_tool("get_thing", {"readOnlyHint": False}) is True
+    assert is_write_tool("get_thing", {"readOnlyHint": True, "destructiveHint": True}) is True
 
 
 def test_check_allowed_enforces_roots_and_secrets(repo, tmp_path_factory):

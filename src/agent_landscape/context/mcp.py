@@ -19,9 +19,28 @@ from ..config import Settings
 
 log = logging.getLogger(__name__)
 
-# heuristics: tools that change state need an explicit opt-in (never auto-selected with their server)
+# heuristics: tools that change state need an explicit opt-in (never auto-selected with their server).
+# LiteLLM's /mcp-rest drops MCP annotations (readOnlyHint), so the tool name is usually all we have.
 _WRITE_RE = re.compile(r"(^|[_\-.])(write|delete|remove|move|rename|patch|append|update|create|insert|put|post|"
-                       r"execute|exec|run|send|upload|drop|set|commit|push|merge|deploy)([_\-.]|$)", re.I)
+                       r"execute|exec|run|send|upload|drop|set|commit|push|merge|deploy|add|assign|unassign|"
+                       r"fork|request|reply|comment|review|approve|dismiss|submit|close|reopen|edit|star|"
+                       r"unstar|archive|transfer|invite|enable|disable|trigger|cancel|rerun|resolve|label|"
+                       r"lock|unlock|publish|mark|dispatch)([_\-.]|$)", re.I)
+_READ_PREFIX_RE = re.compile(r"^(get|list|search|read|fetch|find|query|describe|show|view|count|ui)([_\-.]|$)"
+                             r"|[_\-.](read|get|list|search)$", re.I)  # get_commit, pull_request_read
+
+
+def is_write_tool(name: str, annotations: dict[str, Any] | None = None) -> bool:
+    """True if a tool may change data. Annotations win when present; otherwise a read verb at the
+    start (get_commit, list_issues) means read-only, any write verb anywhere means write."""
+    ann = annotations or {}
+    if ann.get("destructiveHint"):
+        return True
+    if "readOnlyHint" in ann:
+        return not ann["readOnlyHint"]
+    if _READ_PREFIX_RE.search(name):
+        return False
+    return bool(_WRITE_RE.search(name))
 
 
 @dataclass
@@ -73,9 +92,7 @@ class MCPGateway:
         tools = []
         for t in data.get("tools", []):
             info = t.get("mcp_info") or {}
-            ann = t.get("annotations") or {}
-            write = not ann.get("readOnlyHint", False) and bool(_WRITE_RE.search(t.get("name", ""))) \
-                or bool(ann.get("destructiveHint"))
+            write = is_write_tool(t.get("name", ""), t.get("annotations"))
             tools.append(MCPTool(server=info.get("server_name") or "mcp", server_id=info.get("server_id") or "",
                                  name=t.get("name", ""), description=t.get("description") or "",
                                  input_schema=t.get("inputSchema") or {"type": "object", "properties": {}},
