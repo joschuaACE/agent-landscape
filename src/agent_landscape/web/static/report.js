@@ -3,6 +3,9 @@ import { renderMarkdown } from './md.js';
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmt = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e4 ? `${(n / 1e3).toFixed(1)}k` : String(n ?? 0));
+// prompt-cache traffic (claude-code/*): shown next to tokens, never added to them
+const cache = (o) => (o.cache_read_tokens || o.cache_write_tokens
+  ? ` · cache ${fmt(o.cache_read_tokens || 0)} read / ${fmt(o.cache_write_tokens || 0)} write` : '');
 const dur = (s) => (s == null ? '–' : s < 60 ? `${Math.round(s)}s` : `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`);
 const clock = (ts) => (ts ? new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '');
 const slug = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'mission';
@@ -235,7 +238,7 @@ export function createReportView({ el, store, api, toast, map, onInspect, onChan
     const canFeedback = t.status !== 'active' && t.root_agent_id;
     const rounds = d.rounds.map((r) => `<li data-n="${r.round}">
         <div><b>${r.kind === 'mission' ? '🎯 Mission briefing' : '💬 Feedback'}</b> ${stateIcon(r.state)}
-          <span class="when">${clock(r.started_at)}${r.duration ? ` · ${dur(r.duration)}` : ''} · 🪙 ${fmt(r.tokens)} · $${(r.cost || 0).toFixed(4)}</span>
+          <span class="when">${clock(r.started_at)}${r.duration ? ` · ${dur(r.duration)}` : ''} · 🪙 ${fmt(r.tokens)}${cache(r)} · $${(r.cost || 0).toFixed(4)}</span>
           <button class="btn ghost small" data-rv="goto" data-round="${r.round}">📜 Result</button></div>
         <div class="md">${renderMarkdown(r.input)}</div>
       </li>`).join('');
@@ -288,7 +291,7 @@ export function createReportView({ el, store, api, toast, map, onInspect, onChan
           <div><h3>${esc(a.agent_name)}</h3>
             <div class="sub">${esc(ROLE_LABEL[a.role] || a.title || a.role)}${a.level ? ` · Lv ${a.level}` : ''} · ${stateIcon(a.state)} ${esc(a.state)}
               ${parent ? ` · reports to ${parent.icon} ${esc(parent.agent_name)}` : ''}</div>
-            <div class="sub">${a.profile ? `<span title="Agent profile (system instructions &amp; tool access) – ${esc(a.profile_source || '')}">🧬 ${esc(a.profile)}${a.profile_rev ? `@${esc(a.profile_rev)}` : ''}</span> · ` : ''}${a.skills_used?.length ? `🧠 skills: ${a.skills_used.map(esc).join(', ')} · ` : ''}${a.model ? `🤖 ${esc(a.model)} · ` : ''}🪙 ${fmt(a.tokens)} · $${(a.cost || 0).toFixed(4)} · ⏱ ${dur(a.duration)} · A2A task <code>${esc(a.task_id.slice(0, 8))}</code></div>
+            <div class="sub">${a.profile ? `<span title="Agent profile (system instructions &amp; tool access) – ${esc(a.profile_source || '')}">🧬 ${esc(a.profile)}${a.profile_rev ? `@${esc(a.profile_rev)}` : ''}</span> · ` : ''}${a.skills_used?.length ? `🧠 skills: ${a.skills_used.map(esc).join(', ')} · ` : ''}${a.model ? `🤖 ${esc(a.model)} · ` : ''}🪙 ${fmt(a.tokens)}${cache(a)} · $${(a.cost || 0).toFixed(4)} · ⏱ ${dur(a.duration)} · A2A task <code>${esc(a.task_id.slice(0, 8))}</code></div>
           </div>
           <div class="tools">
             ${live ? `<button class="btn small" data-rv="inspect" data-agent="${a.agent_id}" title="Show unit on the map">🎯 Unit</button>` : ''}
