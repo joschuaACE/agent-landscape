@@ -75,6 +75,9 @@ class RepoSpec:
     branch: str | None = None  # base branch for missions; None = remote default (origin/HEAD)
     description: str = ""
     keywords: list[str] = field(default_factory=list)
+    # GitHub account (logged in via `gh auth login`) used for PRs on this repo – one account per org/client,
+    # no `gh auth switch` needed. None = gh's active account.
+    gh_user: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v not in (None, "", [])} | {"name": self.name}
@@ -96,7 +99,10 @@ class RepoSpec:
         kw = d.get("keywords") or []
         if isinstance(kw, str):
             kw = [k for k in re.split(r"[,\n]", kw)]
-        return cls(name=name, url=url, path=path, branch=branch,
+        gh_user = str(d.get("gh_user") or "").strip() or None
+        if gh_user and not re.match(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,38}$", gh_user):
+            raise RepoError("invalid GitHub user name in gh_user")
+        return cls(name=name, url=url, path=path, branch=branch, gh_user=gh_user,
                    description=" ".join(str(d.get("description") or "").split())[:400],
                    keywords=[" ".join(str(k).split()).lower() for k in kw if str(k).strip()][:20])
 
@@ -117,6 +123,7 @@ class MissionRepo:
     commits: list[dict[str, Any]] = field(default_factory=list)
     changed: list[str] = field(default_factory=list)  # "M path" vs base (incl. uncommitted)
     pushed: dict[str, Any] | None = None
+    gh_user: str | None = None  # GitHub account for PRs (from the registry, see RepoSpec.gh_user)
     pr: dict[str, Any] | None = None  # pull request opened by the human (url, number, host, at)
     checks: list[dict[str, Any]] = field(default_factory=list)  # run_check history (newest last)
 
@@ -291,7 +298,8 @@ class RepoRegistry:
             else:
                 await git("worktree", "add", "--detach", str(wt), base_sha, cwd=src)
         mr = MissionRepo(name=spec.name, path=str(wt), source=str(src), base=base, base_sha=base_sha,
-                         write=write, branch=branch, url=spec.url, description=spec.description)
+                         write=write, branch=branch, url=spec.url, description=spec.description,
+                         gh_user=spec.gh_user)
         return mr, warning
 
     async def _free_branch(self, src: Path, name: str) -> str:
@@ -510,13 +518,14 @@ async def remote_url(mr: MissionRepo) -> str | None:
         return mr.url
 
 
-async def _cli(argv: list[str], cwd: str, timeout: float = 120) -> str:
+async def _cli(argv: list[str], cwd: str, timeout: float = 120, env_extra: dict[str, str] | None = None) -> str:
     """Run gh / az non-interactively; errors carry the CLI's own message."""
     if shutil.which(argv[0]) is None:
         hint = ("install the GitHub CLI and run `gh auth login`" if argv[0] == GH_BIN else
                 "install the Azure CLI + `az extension add --name azure-devops`, then `az login`")
         raise RepoError(f"{argv[0]} not found – {hint}")
-    env = {**os.environ, "GH_PROMPT_DISABLED": "1", "NO_COLOR": "1", "AZURE_CORE_NO_COLOR": "1"}
+    env = {**os.environ, "GH_PROMPT_DISABLED": "1", "NO_COLOR": "1", "AZURE_CORE_NO_COLOR": "1",
+           **(env_extra or {})}
     proc = await asyncio.create_subprocess_exec(*argv, cwd=cwd, env=env, stdin=asyncio.subprocess.DEVNULL,
                                                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
@@ -562,21 +571,37 @@ async def create_pr(mr: MissionRepo, title: str, body: str, *, draft: bool = Fal
     return mr.pr
 
 
+async def gh_env(user: str | None, cwd: str) -> dict[str, str]:
+    """GH_TOKEN of a specific logged-in gh account (``gh auth token --user``) – avoids `gh auth switch`."""
+    if not user:
+        return {}
+    try:
+        token = (await _cli([GH_BIN, "auth", "token", "--hostname", "github.com", "--user", user], cwd)).strip()
+    except RepoError:
+        raise RepoError(f"gh is not logged in as '{user}' (gh_user of this repo). Run `gh auth login` once "
+                        f"with that account – gh keeps several accounts; no switching needed afterwards.") from None
+    return {"GH_TOKEN": token} if token else {}
+
+
 async def _github_pr(mr: MissionRepo, t: dict[str, str], base: str, title: str, body: str,
                      draft: bool) -> dict[str, Any]:
+    env = await gh_env(mr.gh_user, mr.path)
     try:
         existing = json.loads(await _cli([GH_BIN, "pr", "list", "--repo", t["repo"], "--head", mr.branch or "",
-                                          "--state", "open", "--json", "url,number"], mr.path) or "[]")
+                                          "--state", "open", "--json", "url,number"], mr.path, env_extra=env)
+                              or "[]")
     except RepoError as exc:
         if "Could not resolve to a Repository" in str(exc):  # gh logged in with another GitHub account
-            raise RepoError(f"{exc} – the active gh account can't see {t['repo']}. Log in with the account that "
-                            "owns it (`gh auth login`) and select it (`gh auth switch`), then retry.") from None
+            who = f"gh account '{mr.gh_user}'" if mr.gh_user else "active gh account"
+            raise RepoError(f"{exc} – the {who} can't see {t['repo']}. Run `gh auth login` with the account that "
+                            f"has access and set `gh_user: <that account>` for repo {mr.name} in repos.yaml "
+                            "(or `gh auth switch`), then retry.") from None
         raise
     if existing:
         return {"url": existing[0]["url"], "number": existing[0]["number"], "existing": True}
     argv = [GH_BIN, "pr", "create", "--repo", t["repo"], "--head", mr.branch or "", "--base", base,
             "--title", title, "--body", body or title] + (["--draft"] if draft else [])
-    out = await _cli(argv, mr.path)
+    out = await _cli(argv, mr.path, env_extra=env)
     url = next((ln.strip() for ln in reversed(out.splitlines()) if ln.strip().startswith("http")), "")
     if not url:
         raise RepoError(f"gh did not return a PR URL: {out.strip()[-300:]}")

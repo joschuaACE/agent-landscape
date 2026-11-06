@@ -93,6 +93,7 @@ class RepoIn(BaseModel):
     branch: str | None = Field(default=None, max_length=200)
     description: str = Field(default="", max_length=400)
     keywords: list[str] = Field(default_factory=list, max_length=20)
+    gh_user: str | None = Field(default=None, max_length=39)  # GitHub account for PRs (gh auth login)
 
 
 class FeedbackRequest(BaseModel):
@@ -438,6 +439,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def create_pr(topic_id: str, name: str, body: dict | None = None):
         """Human approval step: push (if needed) + open a pull request with the user's gh / az login."""
         mr = _mission_repo(topic_id, name)
+        spec = runtime.repos.get(mr.name)
+        if spec is not None:  # registry wins: gh_user may have been set after the mission started
+            mr.gh_user = spec.gh_user
         topic = runtime.topics.get(topic_id)
         body = body or {}
         try:
