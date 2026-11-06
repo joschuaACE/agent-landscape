@@ -213,6 +213,10 @@ function updateStats(s) {
   set('#r-msgs', fmt(s.a2a_messages));
   set('#r-tokens', fmt(s.tokens));
   set('#r-cost', `$${(s.cost || 0).toFixed(s.cost < 1 ? 4 : 2)}`);
+  const costEl = $('#r-cost')?.closest('[title]');
+  if (costEl) {
+    costEl.title = `Cost reported by LiteLLM${s.notional_cost ? ` · + $${s.notional_cost.toFixed(4)} notional on the Claude Code subscription (not billed)` : ''}`;
+  }
   const xp = (s.missions_completed || 0) * 250 + (s.agents_spawned || 0) * 15 + Math.floor((s.tokens || 0) / 50);
   let idx = 0;
   RANKS.forEach(([min], i) => { if (xp >= min) idx = i; });
@@ -472,7 +476,7 @@ function renderReportList() {
       ${ts.map((t) => `<div class="report-row ${t.id === openId ? 'open' : ''}" style="--c:${t.color}" data-report="${t.id}">
         <span class="ico">${stIcon[t.status] || '📑'}</span><b title="${esc(t.goal)}">${esc(t.title)}</b>
         <span class="chip ${t.status}">${t.status}</span>
-        <small>${t.rounds > 1 ? `🔁 ${t.rounds} rounds · ` : ''}🪙 ${fmt(t.tokens || 0)} · $${(t.cost || 0).toFixed(4)} · ${new Date(t.created_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</small>
+        <small>${t.rounds > 1 ? `🔁 ${t.rounds} rounds · ` : ''}🪙 ${fmt(t.tokens || 0)} · $${(t.cost || 0).toFixed(4)}${t.notional_cost ? ` <span title="API-equivalent of subscription calls – not billed">(🏷️ $${t.notional_cost.toFixed(4)})</span>` : ''} · ${new Date(t.created_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</small>
       </div>`).join('')}</div>`;
   }).join('') || '<p class="muted small" style="text-align:center">No reports yet – they appear as soon as a mission is deployed.</p>';
 }

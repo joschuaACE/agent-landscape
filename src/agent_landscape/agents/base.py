@@ -160,6 +160,8 @@ class Agent:
             if usage["cache_read_tokens"] or usage["cache_write_tokens"]:
                 ctx.task.metadata.update(cache_read_tokens=usage["cache_read_tokens"],
                                          cache_write_tokens=usage["cache_write_tokens"])
+            if usage.get("notional_cost"):
+                ctx.task.metadata.update(notional_cost=round(usage["notional_cost"], 7))
             ctx.task.metadata.update(tokens=usage["tokens"], cost=round(usage["cost"], 6), model=usage["model"],
                                      tool_calls=usage.get("tool_calls", []), skills_used=list(self.skills_used),
                                      finished_at=time.time())
@@ -292,8 +294,11 @@ class Agent:
             usage["cache_read_tokens"] += getattr(res, "cache_read_tokens", 0)
             usage["cache_write_tokens"] += getattr(res, "cache_write_tokens", 0)
             usage["cost"] += res.cost
+            # what a subscription call (claude-code/*) *would* cost on the API – shown, never added to cost
+            usage["notional_cost"] = usage.get("notional_cost", 0.0) + getattr(res, "notional_cost", 0.0)
             usage["model"] = res.model
-        self.runtime.add_usage(res.tokens, res.cost, topic_id=usage["topic_id"] if usage else self.topic_id)
+        self.runtime.add_usage(res.tokens, res.cost, topic_id=usage["topic_id"] if usage else self.topic_id,
+                               notional_cost=getattr(res, "notional_cost", 0.0))
 
     def spawn(self, cls: type["Agent"], **kwargs: Any) -> "Agent":
         kwargs.setdefault("mode", self.mode)

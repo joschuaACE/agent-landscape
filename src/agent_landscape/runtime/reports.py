@@ -57,6 +57,7 @@ def _entry(task: Task, rt: "Runtime") -> dict[str, Any]:
         "cache_read_tokens": md.get("cache_read_tokens", 0),
         "cache_write_tokens": md.get("cache_write_tokens", 0),
         "cost": md.get("cost", 0.0),
+        "notional_cost": md.get("notional_cost", 0.0),
         "model": md.get("model"),
         "profile": md.get("profile"),
         "profile_rev": md.get("profile_rev"),
@@ -117,6 +118,8 @@ def build_report(rt: "Runtime", topic: "Topic") -> dict[str, Any]:
             **{k: sum(e[k] or 0 for e in entries) + (head[k] if head else 0)
                for k in ("cache_read_tokens", "cache_write_tokens")},
             "cost": round(sum(e["cost"] or 0 for e in entries) + (head["cost"] if head else 0), 6),
+            "notional_cost": round(sum(e["notional_cost"] or 0 for e in entries)
+                                   + (head["notional_cost"] if head else 0), 7),
             "artifacts": artifacts,
         })
 
@@ -135,6 +138,7 @@ def build_report(rt: "Runtime", topic: "Topic") -> dict[str, Any]:
             "units": len(agent_ids),
             "tokens": topic.tokens,
             "cost": round(topic.cost, 6),
+            "notional_cost": round(topic.notional_cost, 7),
             "duration": round((topic.finished_at or 0) - topic.created_at, 1) if topic.finished_at else None,
         },
     }
@@ -161,6 +165,7 @@ def report_markdown(report: dict[str, Any]) -> str:
         f"- **Formation:** {t['mode']} · **Rounds:** {totals['rounds']} · **Units:** {totals['units']} · "
         f"**A2A tasks:** {totals['a2a_tasks']}  ",
         f"- **Tokens:** {totals['tokens']:,} · **Cost:** ${totals['cost']:.4f}"
+        + (f" (+ ${totals['notional_cost']:.4f} notional on subscription)" if totals.get("notional_cost") else "")
         + (f" · **Duration:** {totals['duration']:.0f}s" if totals["duration"] else ""),
         "",
         "## Objective",
