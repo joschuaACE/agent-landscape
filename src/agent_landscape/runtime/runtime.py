@@ -72,6 +72,7 @@ class Topic:
     feedback_queued: bool = False  # sent to the Commander, round not started yet
     tokens: int = 0
     cost: float = 0.0
+    notional_cost: float = 0.0  # API-equivalent of subscription (claude-code/*) calls – not real spend
     context: list[dict[str, Any]] = field(default_factory=list)  # attached intel (summary, incl. errors)
     knowledge: list[dict[str, Any]] = field(default_factory=list)  # linked knowledge bases (vector stores)
     team: str | None = None  # key of the team (teams.yaml) that runs this mission
@@ -88,7 +89,8 @@ class Topic:
             "mode": self.mode, "status": self.status, "kind": self.kind,
             "root_agent_id": self.root_agent_id, "task_id": self.task_id,
             "result": self.result, "rounds": self.rounds, "feedback": self.feedback,
-            "tokens": self.tokens, "cost": round(self.cost, 6), "context": self.context,
+            "tokens": self.tokens, "cost": round(self.cost, 6), "notional_cost": round(self.notional_cost, 7),
+            "context": self.context,
             "knowledge": self.knowledge, "team": self.team, "model_pool": self.model_pool,
             "created_at": self.created_at, "finished_at": self.finished_at,
         }
@@ -108,7 +110,7 @@ class Runtime:
         self._region_index = 0
         self._callsign = 0
         self._background: set[asyncio.Task] = set()
-        self.stats = {"tokens": 0, "cost": 0.0, "a2a_messages": 0, "agents_spawned": 0,
+        self.stats = {"tokens": 0, "cost": 0.0, "notional_cost": 0.0, "a2a_messages": 0, "agents_spawned": 0,
                       "missions_completed": 0, "missions_failed": 0, "peak_active": 0,
                       "veterans_redeployed": 0, "feedback_rounds": 0}
         self.http: httpx.AsyncClient | None = None
@@ -770,13 +772,16 @@ class Runtime:
             self._last_active = active
             self._emit_stats()
 
-    def add_usage(self, tokens: int, cost: float, topic_id: str | None = None) -> None:
+    def add_usage(self, tokens: int, cost: float, topic_id: str | None = None, notional_cost: float = 0.0) -> None:
+        """``cost`` = real spend (LiteLLM); ``notional_cost`` = API-equivalent of subscription calls, kept apart."""
         self.stats["tokens"] += tokens
         self.stats["cost"] += cost
+        self.stats["notional_cost"] = self.stats.get("notional_cost", 0.0) + notional_cost
         topic = self.topics.get(topic_id or "")
         if topic is not None and topic.kind == "mission":
             topic.tokens += tokens
             topic.cost += cost
+            topic.notional_cost += notional_cost
             self.persist.topic(topic)
         self._emit_stats()
 
@@ -796,7 +801,8 @@ class Runtime:
 
     def stats_dict(self) -> dict[str, Any]:
         active = sum(1 for a in self.agents.values() if a.status in ACTIVE_STATES)
-        return {**self.stats, "cost": round(self.stats["cost"], 6), "active_agents": active,
+        return {**self.stats, "cost": round(self.stats["cost"], 6),
+                "notional_cost": round(self.stats.get("notional_cost", 0.0), 7), "active_agents": active,
                 "total_agents": len(self.agents), "regions": len(self.domain_regions()),
                 "active_missions": sum(1 for t in self.topics.values() if t.status == "active")}
 

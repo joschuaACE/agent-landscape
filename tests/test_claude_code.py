@@ -271,6 +271,20 @@ def test_cache_tokens_do_not_feed_xp_or_totals() -> None:
         _task_usage.reset(tok)
     assert (usage["tokens"], usage["cache_read_tokens"], usage["cache_write_tokens"]) == (102, 649, 1873)
     assert fake.tokens == 102 and xp == [102 // 20] and added == [(102, 0.0)]
+    assert usage["notional_cost"] == pytest.approx(0.0085609)  # shown separately, never in cost
+
+
+def test_notional_cost_flows_into_topic_and_report_but_not_cost() -> None:
+    from agent_landscape.runtime.runtime import Runtime
+
+    rt = Runtime(Settings(mock=True))
+    topic = rt.create_topic("Notional", "goal")
+    rt.add_usage(102, 0.0, topic_id=topic.id, notional_cost=0.0085609)
+    rt.add_usage(50, 0.002, topic_id=topic.id)  # a gateway call: real cost, no notional
+    assert topic.cost == pytest.approx(0.002) and topic.notional_cost == pytest.approx(0.0085609)
+    assert topic.to_dict()["notional_cost"] == pytest.approx(0.0085609)
+    snap = rt.snapshot()["stats"]
+    assert snap["cost"] == pytest.approx(0.002) and snap["notional_cost"] == pytest.approx(0.0085609)
 
 
 async def test_ac6_mock_mode_never_starts_the_cli(fake_cli: Path) -> None:
