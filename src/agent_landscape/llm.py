@@ -66,7 +66,7 @@ class LLM:
         return m
 
     async def _complete_claude_code(self, messages: list[dict[str, Any]], model: str,
-                                    tools: list[dict[str, Any]] | None) -> LLMResult:
+                                    tools: list[dict[str, Any]] | None, bridge_url: str | None = None) -> LLMResult:
         """Route claude-code/* to the local CLI runner – never to LiteLLM (it has no such provider)."""
         if not self.settings.claude_code_enabled:
             raise RuntimeError("claude-code/* models need CLAUDE_CODE_ENABLED=1 (local Claude Code CLI provider); "
@@ -75,7 +75,7 @@ class LLM:
             from .claude_code import ClaudeCodeRunner  # lazy: claude_code imports this module
 
             self._claude_code = ClaudeCodeRunner(self.settings)
-        return await self._claude_code.complete(messages, model, tools)
+        return await self._claude_code.complete(messages, model, tools, bridge_url)
 
     async def complete(
         self,
@@ -87,11 +87,12 @@ class LLM:
         headers: dict[str, str] | None = None,
         metadata: dict[str, Any] | None = None,
         tools: list[dict[str, Any]] | None = None,
+        bridge_url: str | None = None,  # claude-code/* only: MCP bridge serving this agent's toolbox
     ) -> LLMResult:
         s = self.settings
         resolved = self.resolve_model(model)
         if not s.mock and resolved.startswith(CLAUDE_CODE_PREFIX):
-            return await self._complete_claude_code(messages, resolved, tools)
+            return await self._complete_claude_code(messages, resolved, tools, bridge_url)
         kwargs: dict[str, Any] = {
             "model": resolved,
             "messages": messages,

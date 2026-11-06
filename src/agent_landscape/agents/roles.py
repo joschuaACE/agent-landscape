@@ -24,10 +24,11 @@ def fill(template: str, **values: Any) -> str:
         return template
 
 
-def models_text(models: list[str]) -> str:
+def models_text(models: list[str], claude_code_tools: bool = False) -> str:
     """Auto model mode: the pool the orchestrator may choose from, per subtask."""
-    lines = [f'- "{m}"' + (" (no tools – text-only work such as writing or synthesis)"
-                             if m.startswith("claude-code/") else "") for m in models]
+    note = (" (Claude Code subscription – tools via MCP bridge)" if claude_code_tools else
+            " (no tools – text-only work such as writing or synthesis)")
+    lines = [f'- "{m}"' + (note if m.startswith("claude-code/") else "") for m in models]
     return ("Models (auto mode): set \"model\" per subtask to one of these, matched to its complexity – a "
             "smaller/faster model for simple lookups, summaries and formatting; a stronger model for complex "
             "reasoning, architecture, code changes and reviews. Subtasks that need tools (files, repos, knowledge, "
@@ -35,7 +36,8 @@ def models_text(models: list[str]) -> str:
 
 
 def plan_system_prompt(profile: Any, workers: list[Any], max_subtasks: int, allow_delegate: bool,
-                       allow_swarm: bool, allies: list[dict], models: list[str] | None = None) -> str:
+                       allow_swarm: bool, allies: list[dict], models: list[str] | None = None,
+                       claude_code_tools: bool = False) -> str:
     """Orchestrator planning prompt: profile persona + plan template, plus the parts the code relies on
     (available specialists, strategies, JSON format) which users cannot break by editing."""
     strategies = ['- "single": one specialist agent handles the subtask.']
@@ -57,7 +59,7 @@ def plan_system_prompt(profile: Any, workers: list[Any], max_subtasks: int, allo
     plan = profile.prompts.get("plan") or (
         "Break the mission into at most {max_subtasks} focused subtasks that specialist agents can execute in parallel.")
     first = workers[0].key if workers else "researcher"
-    model_part = f"\n\n{models_text(models)}" if models else ""
+    model_part = f"\n\n{models_text(models, claude_code_tools)}" if models else ""
     model_field = f', "model": "{models[0]}"' if models else ""
     return (
         f"{profile.prompt}\n\n{fill(plan, max_subtasks=max_subtasks)}\n\n"

@@ -159,8 +159,15 @@ agents can use Claude through the official `claude` CLI under your own login. Li
 - **Your personal Claude Code setup is ignored:** the runner always passes `--setting-sources project`, so
   `~/.claude/CLAUDE.md` and `~/.claude/settings.json` (`env`, `apiKeyHelper`, `hooks`) are **not** loaded. Your
   company's managed policy still applies.
-- **Limitations:** no landscape tools (text only – such agents are told they have no tools), no streaming, and the
-  seat's quota is shared by every agent using it.
+- **Landscape tools via MCP bridge:** `claude -p` runs its own tool loop, so it gets exactly one MCP server: a
+  loopback endpoint of this app (`/mcp/bridge/<token>`) serving *that agent's* toolbox – repo, files, knowledge,
+  skills, checks, LiteLLM MCP tools. Every call still goes through the toolbox (profile tool access, sandboxes,
+  secret protection, 🔧 events in the map and report, `MAX_TOOL_STEPS` budget). Claude Code's own tools (Bash,
+  Edit, Read …) stay off; only `mcp__landscape__*` is allowed (`--permission-mode dontAsk`). One random token per
+  agent turn, loopback clients only. `CLAUDE_CODE_TOOLS=0` switches back to text-only. See
+  [ADR-0002](docs/adr/0002-claude-code-mcp-bridge.md).
+- **Limitations:** no streaming, the seat's quota is shared by every agent using it, and a whole tool loop must
+  finish within `CLAUDE_CODE_TIMEOUT`.
 - **Tokens & cost:** `tokens` = input + output only. Prompt-cache traffic is shown separately in reports
   (`cache … read / … write`) and never counted into totals or XP. Cost is $0 (subscription); the CLI's would-be API
   price is kept as `notional_cost`. Token counts are therefore not directly comparable with gateway models.
@@ -384,6 +391,7 @@ Everything survives a restart: regions, missions (incl. feedback rounds, intel, 
 | `CLAUDE_CODE_TIMEOUT` | `300` | Seconds per CLI call |
 | `CLAUDE_CODE_CONCURRENCY` | `2` | Max parallel CLI processes |
 | `CLAUDE_CODE_ALLOW_REMOTE` | off | Allow the provider when `HOST` is not loopback (not recommended) |
+| `CLAUDE_CODE_TOOLS` | on | Landscape tools for `claude-code/*` agents via the loopback MCP bridge (`0` = text-only) |
 | `CLAUDE_CODE_SETTING_SOURCES` | `project` | The CLI's `--setting-sources` (empty = `project`). The default skips `~/.claude/CLAUDE.md` and `~/.claude/settings.json`; including `user` logs a warning |
 | `MAX_DEPTH` / `MAX_SUBTASKS` | `3` / `4` | Hierarchy depth and plan width |
 | `DEFAULT_SWARM_SIZE` / `MAX_SWARM_SIZE` / `MAX_AGENTS` | `3` / `6` / `80` | Swarm and safety limits |

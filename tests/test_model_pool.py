@@ -46,7 +46,7 @@ def test_repo_editors_never_run_tool_less_when_pool_has_a_gateway_model() -> Non
     pool = ["claude-code/opus", "gpt-x"]
     rt = SimpleNamespace(topics={"t": SimpleNamespace(model_pool=pool)},
                          intel={"t": SimpleNamespace(repos=[SimpleNamespace(write=True)])},
-                         settings=SimpleNamespace(default_model="claude-code/haiku"),
+                         settings=SimpleNamespace(default_model="claude-code/haiku", claude_code_tools=False),
                          log=lambda msg, level="info", **_: logs.append((level, msg)))
     orch = SimpleNamespace(runtime=rt, topic_id="t", name="Orch")
     orch._pool = lambda: Orchestrator._pool(orch)
@@ -60,6 +60,9 @@ def test_repo_editors_never_run_tool_less_when_pool_has_a_gateway_model() -> Non
     rt.topics["t"].model_pool = ["claude-code/opus"]
     assert Orchestrator._tool_capable(orch, "claude-code/opus", engineer, st) == "claude-code/opus"
     assert logs[-1][0] == "error" and "can't change files" in logs[-1][1]
+    rt.settings.claude_code_tools = True  # MCP bridge on: claude-code/* agents keep their tools → no swap
+    rt.topics["t"].model_pool = pool
+    assert Orchestrator._tool_capable(orch, "claude-code/opus", engineer, st) == "claude-code/opus"
 
 
 def _free_port() -> int:
