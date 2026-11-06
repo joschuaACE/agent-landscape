@@ -14,11 +14,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fnmatch
+import functools
 import json
 import logging
 import os
 import re
 import shutil
+import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -465,9 +467,32 @@ _AZURE_RE = [
 ]
 
 
+_SSH_URL_RE = re.compile(r"^(?:ssh://)?(?P<user>[\w.-]+)@(?P<host>[\w.-]+)(?P<sep>[:/])(?P<path>.+)$")
+_KNOWN_HOSTS = ("github.com", "ssh.dev.azure.com", "dev.azure.com")
+
+
+@functools.lru_cache(maxsize=64)
+def ssh_hostname(alias: str) -> str:
+    """Real host behind an ~/.ssh/config alias (``Host github-datev`` → ``github.com``); the alias itself if none."""
+    try:
+        out = subprocess.run(["ssh", "-G", alias], capture_output=True, text=True, timeout=5, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return alias
+    return next((ln.split(None, 1)[1].strip() for ln in out.splitlines() if ln.lower().startswith("hostname ")), alias)
+
+
+def canonical_url(url: str) -> str:
+    """Rewrite SSH host aliases (one key per GitHub account) to the real host so PR hosts are recognised."""
+    m = _SSH_URL_RE.match(url)
+    if not m or m["host"] in _KNOWN_HOSTS or m["host"].endswith(".visualstudio.com"):
+        return url
+    real = ssh_hostname(m["host"])
+    return url if real == m["host"] else f"{m['user']}@{real}:{m['path']}"
+
+
 def pr_target(url: str | None) -> dict[str, str] | None:
     """Which host a remote URL belongs to and how to address it there (None = no PR support)."""
-    url = (url or "").strip()
+    url = canonical_url((url or "").strip())
     if m := _GITHUB_RE.match(url):
         return {"host": "github", "repo": f"{m['owner']}/{m['repo']}"}
     for rx in _AZURE_RE:
@@ -539,8 +564,14 @@ async def create_pr(mr: MissionRepo, title: str, body: str, *, draft: bool = Fal
 
 async def _github_pr(mr: MissionRepo, t: dict[str, str], base: str, title: str, body: str,
                      draft: bool) -> dict[str, Any]:
-    existing = json.loads(await _cli([GH_BIN, "pr", "list", "--repo", t["repo"], "--head", mr.branch or "",
-                                      "--state", "open", "--json", "url,number"], mr.path) or "[]")
+    try:
+        existing = json.loads(await _cli([GH_BIN, "pr", "list", "--repo", t["repo"], "--head", mr.branch or "",
+                                          "--state", "open", "--json", "url,number"], mr.path) or "[]")
+    except RepoError as exc:
+        if "Could not resolve to a Repository" in str(exc):  # gh logged in with another GitHub account
+            raise RepoError(f"{exc} – the active gh account can't see {t['repo']}. Log in with the account that "
+                            "owns it (`gh auth login`) and select it (`gh auth switch`), then retry.") from None
+        raise
     if existing:
         return {"url": existing[0]["url"], "number": existing[0]["number"], "existing": True}
     argv = [GH_BIN, "pr", "create", "--repo", t["repo"], "--head", mr.branch or "", "--base", base,
