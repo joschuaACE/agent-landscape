@@ -234,6 +234,8 @@ class Orchestrator(Agent):
         """A repo-editing specialist on a tool-less claude-code/* model can't change anything (it would only
         *describe* edits). Swap to a gateway model from the pool; if there is none, warn loudly."""
         rt = self.runtime
+        if rt.settings.claude_code_tools:  # MCP bridge: claude-code/* agents have their tools
+            return model
         repos = getattr(rt.intel.get(self.topic_id), "repos", [])
         if "repo_write" not in prof.tools or not any(r.write for r in repos):
             return model
@@ -309,7 +311,7 @@ class Orchestrator(Agent):
                                    for a, (t, spec, strat) in ((a, self._team_entry(a)) for a in team)))
         raw = await self.think(
             plan_system_prompt(self._prof(), self._workers(), s.max_subtasks, allow_delegate, allow_swarm, allies,
-                               models=self._pool()),
+                               models=self._pool(), claude_code_tools=s.claude_code_tools),
             prompt,
             activity="Revising battle plan" if followup else "Drafting battle plan",
             temperature=0.2,

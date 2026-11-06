@@ -30,6 +30,7 @@ from .events import EventBus
 from ..context.intel import ContextItem, MissionIntel, items_to_parts
 from ..context.intel import resolve as resolve_intel
 from ..context.mcp import MCPGateway
+from ..context.mcp_bridge import MCPBridge
 from ..context.repos import MissionRepo, RepoError, RepoRegistry
 from ..context.repos import commit as repo_commit
 from ..context.repos import refresh_changes as repo_refresh
@@ -100,6 +101,8 @@ class Runtime:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.llm = LLM(settings)
+        # claude-code/* agents reach their toolbox through this loopback MCP endpoint (the CLI calls back in)
+        self.mcp_bridge = MCPBridge(f"http://127.0.0.1:{settings.port}")
         self.tasks = TaskManager()
         self.bus = EventBus()
         self.agents: dict[str, Agent] = {}
@@ -817,6 +820,7 @@ class Runtime:
                            for k in DOMAIN_BIOMES],
                 "mock": self.settings.mock,
                 "default_model": self.settings.default_model,
+                "claude_code_tools": self.settings.claude_code_tools,
                 "model_problems": self.model_problems,
                 "proxy": bool(self.settings.proxy_url),
                 "max_swarm_size": self.settings.max_swarm_size,

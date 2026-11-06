@@ -204,8 +204,9 @@ class Agent:
             temperature = prof.temperature if prof is not None and prof.temperature is not None else 0.7
         model = self.pinned_model or model or self.model or (prof.model if prof is not None else None)
         settings = self.runtime.settings
-        if use_tools and not settings.mock and (model or settings.default_model).startswith("claude-code/"):
-            # the local Claude Code CLI runs without landscape tools – don't advertise tools it can't call
+        claude_code = not settings.mock and str(model or settings.default_model).startswith("claude-code/")
+        if use_tools and claude_code and not settings.claude_code_tools:
+            # bridge switched off: don't advertise tools the CLI can't call
             # (the model would otherwise "describe" tool calls or invent their results)
             use_tools = False
             system += ("\n\n---\nNote: you have NO tools in this run. Answer only from the context given here; "
@@ -237,35 +238,62 @@ class Agent:
                 await self._run_tool(toolbox, name, args, activity)
             tools = []
 
+        bridge = self._open_bridge(toolbox, activity, max_steps) if claude_code and tools else None
+        if bridge is not None:
+            messages[0]["content"] += (
+                "\n\n---\nYour tools are available as MCP tools named mcp__landscape__<tool> (e.g. "
+                f"mcp__landscape__{tools[0]['function']['name']}). Budget: {max_steps} tool calls. "
+                "Never claim you changed or read something without a successful tool result.")
         steps = 0
-        while True:
-            res = await self.runtime.llm.complete(
-                messages,
-                model=model or self.model,
-                mock=mock,
-                temperature=temperature,
-                headers=_litellm_headers.get() or None,
-                metadata={"agent_id": self.id, "topic_id": self.topic_id},
-                tools=tools or None,
-            )
-            self._account(res)
-            if not res.tool_calls or not toolbox or steps >= max_steps + 1:
-                break
-            messages.append(res.assistant_message())
-            for tc in res.tool_calls:
-                if steps >= max_steps:
-                    result = "Tool budget exhausted – give your final answer now with the information you have."
-                else:
-                    result = await self._run_tool(toolbox, tc.name, tc.arguments, activity)
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-            steps += 1
-            tools = toolbox.specs(self)  # e.g. a knowledge base created this turn becomes searchable
-            if steps == max_steps:
-                messages.append({"role": "user", "content": "You have used your tool budget. "
-                                 "Answer now, without calling more tools."})
-            self.set_status("thinking", activity)
+        try:
+            while True:
+                res = await self.runtime.llm.complete(
+                    messages,
+                    model=model or self.model,
+                    mock=mock,
+                    temperature=temperature,
+                    headers=_litellm_headers.get() or None,
+                    metadata={"agent_id": self.id, "topic_id": self.topic_id},
+                    tools=tools or None,
+                    bridge_url=bridge.url if bridge else None,
+                )
+                self._account(res)
+                if not res.tool_calls or not toolbox or steps >= max_steps + 1:
+                    break
+                messages.append(res.assistant_message())
+                for tc in res.tool_calls:
+                    if steps >= max_steps:
+                        result = "Tool budget exhausted – give your final answer now with the information you have."
+                    else:
+                        result = await self._run_tool(toolbox, tc.name, tc.arguments, activity)
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                steps += 1
+                tools = toolbox.specs(self)  # e.g. a knowledge base created this turn becomes searchable
+                if steps == max_steps:
+                    messages.append({"role": "user", "content": "You have used your tool budget. "
+                                     "Answer now, without calling more tools."})
+                self.set_status("thinking", activity)
+        finally:
+            self.runtime.mcp_bridge.close(bridge)
         self.set_status("working" if prev[0] in ("thinking", "idle") else prev[0], prev[1])
         return res.text or "(no answer – the tool budget ran out)"
+
+    def _open_bridge(self, toolbox: Any, activity: str, max_steps: int) -> Any:
+        """claude-code/*: lend this agent's toolbox to the CLI via the loopback MCP bridge for one turn.
+
+        The CLI calls back over HTTP (another task), so the task's usage record is carried over explicitly."""
+        usage = _task_usage.get()
+
+        async def run(name: str, args: dict[str, Any]) -> str:
+            token = _task_usage.set(usage)
+            try:
+                result = await self._run_tool(toolbox, name, args, activity)
+            finally:
+                _task_usage.reset(token)
+            self.set_status("thinking", activity)
+            return result
+
+        return self.runtime.mcp_bridge.open(lambda: toolbox.specs(self), run, max_steps=max_steps, agent=self.name)
 
     async def _run_tool(self, toolbox: Any, name: str, args: Any, activity: str) -> str:
         label = toolbox.label(name, args if isinstance(args, dict) else {})

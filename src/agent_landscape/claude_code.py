@@ -96,21 +96,34 @@ def split_system(system: str, transcript: str) -> tuple[str, str]:
     return head, f"[system instructions]:\n{system}\n\n{transcript}"
 
 
-def build_argv(bin_: str, model: str, system: str, setting_sources: str = "project") -> list[str]:
+BRIDGE_SERVER = "landscape"  # MCP server name → tools are mcp__landscape__<name> inside the CLI
+
+
+def mcp_config(bridge_url: str | None) -> str:
+    servers = {BRIDGE_SERVER: {"type": "http", "url": bridge_url}} if bridge_url else {}
+    return json.dumps({"mcpServers": servers}, separators=(",", ":"))
+
+
+def build_argv(bin_: str, model: str, system: str, setting_sources: str = "project",
+               bridge_url: str | None = None) -> list[str]:
     """The exact CLI invocation. NOTE: Claude Code CLI flags are a moving target – re-check on CLI upgrades.
 
-    - ``--tools ''`` disables all built-in tools; ``--strict-mcp-config`` + an empty ``--mcp-config`` loads
-      no MCP servers.
+    - ``--tools ''`` disables all built-in tools (Bash, Edit, Read …); ``--strict-mcp-config`` loads only the
+      servers in ``--mcp-config``: none, or – with ``bridge_url`` – just the loopback landscape bridge, whose
+      tools are pre-approved (``--allowedTools mcp__landscape``) while everything else is denied
+      (``--permission-mode dontAsk``).
     - ``--setting-sources project`` (cwd = empty temp dir) skips ``~/.claude/CLAUDE.md`` and
       ``~/.claude/settings.json`` (env, apiKeyHelper, hooks) but keeps the seat login. Managed policy applies.
       Never omitted: the CLI default would load user files.
     - ``--no-session-persistence``: no transcripts of agent prompts pile up under ``~/.claude/projects``.
     - ``--mcp-config`` is variadic, so it must stay last.
     """
-    return [bin_, "-p", "--output-format", "json", "--model", model.removeprefix(PREFIX),
+    argv = [bin_, "-p", "--output-format", "json", "--model", model.removeprefix(PREFIX),
             "--system-prompt", system or DEFAULT_SYSTEM, "--tools", "",
-            "--setting-sources", setting_sources.strip() or "project", "--no-session-persistence",
-            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+            "--setting-sources", setting_sources.strip() or "project", "--no-session-persistence"]
+    if bridge_url:
+        argv += ["--allowedTools", f"mcp__{BRIDGE_SERVER}", "--permission-mode", "dontAsk"]
+    return argv + ["--strict-mcp-config", "--mcp-config", mcp_config(bridge_url)]
 
 
 def child_env() -> dict[str, str]:
@@ -197,28 +210,32 @@ class ClaudeCodeRunner:
         self._warned_user = False
 
     async def complete(self, messages: list[dict[str, Any]], model: str,
-                       tools: list[dict[str, Any]] | None = None) -> LLMResult:
+                       tools: list[dict[str, Any]] | None = None, bridge_url: str | None = None) -> LLMResult:
+        """One CLI run. With ``bridge_url`` the CLI runs its own tool loop over the agent's toolbox (MCP bridge),
+        so the result never carries ``tool_calls``."""
         s = self.settings
         problem = remote_problem(s)
         if problem:
             raise RuntimeError(problem)
-        if tools and not self._warned_tools:
+        if tools and not bridge_url and not self._warned_tools:
             self._warned_tools = True
-            log.info("Landscape tools are not supported on claude-code/* (slice 1) – answering without tools")
-        return to_result(await self.run_json(messages, model), model)
+            log.info("claude-code/* runs without landscape tools (CLAUDE_CODE_TOOLS=0) – answering without tools")
+        return to_result(await self.run_json(messages, model, bridge_url), model)
 
-    def argv_for(self, messages: list[dict[str, Any]], model: str) -> tuple[list[str], str]:
+    def argv_for(self, messages: list[dict[str, Any]], model: str,
+                 bridge_url: str | None = None) -> tuple[list[str], str]:
         s = self.settings
         if "user" in [p.strip() for p in s.claude_code_setting_sources.split(",")] and not self._warned_user:
             self._warned_user = True
             log.warning("CLAUDE_CODE_SETTING_SOURCES=%s loads ~/.claude settings and CLAUDE.md into agents",
                         s.claude_code_setting_sources)
         system, transcript = split_system(*build_prompt(messages))
-        return build_argv(s.claude_code_bin, model, system, s.claude_code_setting_sources), transcript
+        return build_argv(s.claude_code_bin, model, system, s.claude_code_setting_sources, bridge_url), transcript
 
-    async def run_json(self, messages: list[dict[str, Any]], model: str) -> dict[str, Any]:
+    async def run_json(self, messages: list[dict[str, Any]], model: str,
+                       bridge_url: str | None = None) -> dict[str, Any]:
         """Run the CLI once and return its (error-checked) result JSON."""
-        argv, transcript = self.argv_for(messages, model)
+        argv, transcript = self.argv_for(messages, model, bridge_url)
         async with self._sem:  # queueing doesn't count against the timeout (that starts inside _run)
             stdout, stderr, code = await self._run(argv, transcript)
         try:

@@ -162,6 +162,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         runtime.log(f"🎛️ Default model switched to {model} (until restart)")
         return config
 
+    # ------------------------------------------------------------ MCP bridge (claude-code/* tool calls)
+    @app.post("/mcp/bridge/{token}")
+    async def mcp_bridge(token: str, request: Request):
+        """JSON-RPC from a local `claude -p` run: the agent's toolbox as MCP tools (loopback + token only)."""
+        if (request.client.host if request.client else "") not in ("127.0.0.1", "::1", "localhost"):
+            raise HTTPException(403, "the MCP bridge only serves local Claude Code runs")
+        session = runtime.mcp_bridge.get(token)
+        if session is None:
+            raise HTTPException(404, "unknown or finished bridge session")
+        try:
+            payload = await request.json()
+        except ValueError:
+            return JSONResponse({"jsonrpc": "2.0", "id": None,
+                                 "error": {"code": -32700, "message": "Parse error"}}, status_code=400)
+        reply = await runtime.mcp_bridge.handle(session, payload)
+        return JSONResponse(reply) if reply is not None else PlainTextResponse("", status_code=202)
+
+    @app.get("/mcp/bridge/{token}")
+    async def mcp_bridge_stream(token: str):
+        """No server-initiated SSE stream (allowed by the streamable-HTTP spec)."""
+        return PlainTextResponse("", status_code=405)
+
+    @app.delete("/mcp/bridge/{token}")
+    async def mcp_bridge_end(token: str):
+        return PlainTextResponse("", status_code=204)
+
     @app.post("/api/missions")
     async def create_mission(req: MissionRequest):
         _check_context_size(req.context)

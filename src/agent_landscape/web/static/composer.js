@@ -293,7 +293,7 @@ export function createComposer({ el, store, api, toast, onDeployed }) {
     const toolLess = (m) => String(m || '').startsWith('claude-code/');
     const allToolLess = model === 'auto' ? pool.every(toolLess) : toolLess(model || store.config.default_model);
     const needsTools = items.some((i) => ['repo', 'path', 'tool', 'store'].includes(i.kind));
-    if (allToolLess && needsTools && !confirm(
+    if (allToolLess && needsTools && !store.config.claude_code_tools && !confirm(
       'All selected models are claude-code/* – they run WITHOUT tools.\n\n'
       + 'Agents will not be able to read or edit the attached repositories, files, knowledge bases or MCP tools '
       + '(an editable repo will get no commits).\n\nTick a gateway model in the pool (or force one). Deploy anyway?')) return;

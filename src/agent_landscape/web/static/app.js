@@ -853,9 +853,11 @@ async function loadModels() {
     sel.value = keep === 'auto' || models.includes(keep) ? keep : ''; // drop stale picks
     const list = $('#cp-model-pool .cp-pool-list');
     const was = new Set([...list.querySelectorAll('input:not(:checked)')].map((i) => i.value)); // keep unticks
-    list.innerHTML = models.map((m) => `<label class="small" title="${m.startsWith('claude-code/') ? 'No tools – text-only work' : 'Gateway model'}">
-      <input type="checkbox" name="model_pool" value="${esc(m)}" ${was.has(m) || m.startsWith('claude-code/') ? '' : 'checked'}>
-      ${esc(m)}${m.startsWith('claude-code/') ? ' <em class="muted">no tools</em>' : ''}</label>`).join('');
+    const ccTools = !!store.config?.claude_code_tools;
+    const ccTag = ccTools ? 'subscription' : 'no tools';
+    list.innerHTML = models.map((m) => `<label class="small" title="${m.startsWith('claude-code/') ? (ccTools ? 'Claude Code subscription – tools via MCP bridge' : 'No tools – text-only work') : 'Gateway model'}">
+      <input type="checkbox" name="model_pool" value="${esc(m)}" ${was.has(m) || (!ccTools && m.startsWith('claude-code/')) ? '' : 'checked'}>
+      ${esc(m)}${m.startsWith('claude-code/') ? ` <em class="muted">${ccTag}</em>` : ''}</label>`).join('');
     $('#cp-model-pool').hidden = sel.value !== 'auto';
     renderLlmPop();
   } catch { /* ignore */ }

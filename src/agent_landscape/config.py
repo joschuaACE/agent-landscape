@@ -100,6 +100,8 @@ class Settings:
     # ~/.claude/CLAUDE.md and ~/.claude/settings.json (env, apiKeyHelper, hooks) are NOT loaded.
     # Managed (enterprise) policy always applies. Empty/unset also means "project" – never the CLI default.
     claude_code_setting_sources: str = "project"
+    # landscape tools for claude-code/* agents via a loopback MCP bridge (their toolbox, our sandbox + logging)
+    claude_code_tools: bool = True
     # git repos agents can work on: registry file (repos.yaml) + workspace for clones and mission worktrees
     repos_file: str | None = None
     workspace_dir: str = field(default_factory=lambda: str(Path("workspace").resolve()))
@@ -176,6 +178,7 @@ class Settings:
             claude_code_concurrency=max(1, _int("CLAUDE_CODE_CONCURRENCY", 2)),
             claude_code_allow_remote=_bool("CLAUDE_CODE_ALLOW_REMOTE"),
             claude_code_setting_sources=os.getenv("CLAUDE_CODE_SETTING_SOURCES", "").strip() or "project",
+            claude_code_tools=_bool("CLAUDE_CODE_TOOLS", True),
             repos_file=(None if os.getenv("REPOS_FILE", "").strip().lower() in ("off", "none")
                         else str(Path(os.getenv("REPOS_FILE") or "repos.yaml").expanduser().resolve())),
             workspace_dir=str(Path(os.getenv("WORKSPACE_DIR") or "workspace").expanduser().resolve()),
