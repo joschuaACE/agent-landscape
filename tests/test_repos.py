@@ -141,6 +141,132 @@ async def test_toolbox_repo_tools_respect_profiles(registry):
     assert "fix: shorter trigger" in out and "Mission commits" in out
 
 
+# ------------------------------------------------------------------ pull requests (fake gh / az)
+FAKE_CLI = """#!{python}
+import json, sys
+from pathlib import Path
+here = Path(__file__).parent
+log = here / "calls.jsonl"
+with log.open("a") as f:
+    f.write(json.dumps(sys.argv) + "\\n")
+args = sys.argv[1:]
+state = here / "opened"
+if args[:2] == ["pr", "list"]:                      # gh
+    print(json.dumps([{{"url": "https://github.com/acme/bot/pull/7", "number": 7}}] if state.exists() else []))
+elif args[:2] == ["pr", "create"]:
+    state.touch(); print("Creating pull request...\\nhttps://github.com/acme/bot/pull/7")
+elif args[:3] == ["repos", "pr", "list"]:           # az
+    print(json.dumps([{{"pullRequestId": 42}}] if state.exists() else []))
+elif args[:3] == ["repos", "pr", "create"]:
+    state.touch(); print(json.dumps({{"pullRequestId": 42}}))
+else:
+    sys.exit("unexpected: " + " ".join(args))
+"""
+
+
+def _fake_cli(tmp: Path, name: str) -> Path:
+    import sys
+
+    d = tmp / f"fake-{name}"
+    d.mkdir()
+    p = d / name
+    p.write_text(FAKE_CLI.format(python=sys.executable))
+    p.chmod(0o755)
+    return p
+
+
+def _calls(fake: Path) -> list[list[str]]:
+    import json
+
+    log = fake.parent / "calls.jsonl"
+    return [json.loads(ln)[1:] for ln in log.read_text().splitlines()] if log.exists() else []
+
+
+@pytest.mark.parametrize(("url", "expected"), [
+    ("https://github.com/acme/bot.git", {"host": "github", "repo": "acme/bot"}),
+    ("git@github.com:acme/bot.git", {"host": "github", "repo": "acme/bot"}),
+    ("ssh://git@github.com/acme/bot", {"host": "github", "repo": "acme/bot"}),
+    ("https://acme@dev.azure.com/acme/Bots/_git/copilot-bot",
+     {"host": "azure", "org": "https://dev.azure.com/acme", "project": "Bots", "repo": "copilot-bot"}),
+    ("git@ssh.dev.azure.com:v3/acme/Bots/copilot-bot",
+     {"host": "azure", "org": "https://dev.azure.com/acme", "project": "Bots", "repo": "copilot-bot"}),
+    ("https://acme.visualstudio.com/Bots/_git/copilot-bot",
+     {"host": "azure", "org": "https://dev.azure.com/acme", "project": "Bots", "repo": "copilot-bot"}),
+    ("/srv/git/bot.git", None),
+    ("https://gitlab.com/acme/bot.git", None),
+])
+def test_pr_target(url, expected):
+    assert gitrepo.pr_target(url) == expected
+
+
+async def _committed_repo(registry, name="bot"):
+    reg, origin = registry
+    spec = await reg.save({"name": name, "url": str(origin)})
+    mr, _ = await reg.create_worktree(spec, "topic-pr0001", "PR mission", write=True)
+    await gitrepo.write_file(mr, "topics/new.yaml", "kind: AdaptiveDialog\n")
+    await gitrepo.commit(mr, "feat: new topic", "Engineer Bravo")
+    return mr, origin
+
+
+async def test_create_pr_github_pushes_then_reuses_open_pr(registry, tmp_path, monkeypatch):
+    mr, origin = await _committed_repo(registry)
+    gh = _fake_cli(tmp_path, "gh")
+    monkeypatch.setattr(gitrepo, "GH_BIN", str(gh))
+
+    async def fake_remote(_mr):
+        return "git@github.com:acme/bot.git"
+    monkeypatch.setattr(gitrepo, "remote_url", fake_remote)
+
+    pr = await gitrepo.create_pr(mr, "Add  new\ntopic", "Body text")
+    assert pr["url"] == "https://github.com/acme/bot/pull/7" and pr["number"] == 7 and pr["host"] == "github"
+    assert mr.pushed and mr.branch in sh("branch", "--list", cwd=origin)  # pushed first
+    create = next(c for c in _calls(gh) if c[:2] == ["pr", "create"])
+    assert create[create.index("--repo") + 1] == "acme/bot" and create[create.index("--head") + 1] == mr.branch
+    assert create[create.index("--base") + 1] == "main" and create[create.index("--title") + 1] == "Add new topic"
+    assert "--draft" not in create
+
+    again = await gitrepo.create_pr(mr, "x", "y")
+    assert again["existing"] and sum(c[:2] == ["pr", "create"] for c in _calls(gh)) == 1
+
+
+async def test_create_pr_azure_devops(registry, tmp_path, monkeypatch):
+    mr, _ = await _committed_repo(registry)
+    az = _fake_cli(tmp_path, "az")
+    monkeypatch.setattr(gitrepo, "AZ_BIN", str(az))
+
+    async def fake_remote(_mr):
+        return "git@ssh.dev.azure.com:v3/acme/Bots/copilot-bot"
+    monkeypatch.setattr(gitrepo, "remote_url", fake_remote)
+
+    pr = await gitrepo.create_pr(mr, "Topic", "Body", draft=True)
+    assert pr["url"] == "https://dev.azure.com/acme/Bots/_git/copilot-bot/pullrequest/42" and pr["host"] == "azure"
+    create = next(c for c in _calls(az) if c[:3] == ["repos", "pr", "create"])
+    assert create[create.index("--target-branch") + 1] == "main" and create[-2:] == ["--draft", "true"]
+
+
+async def test_create_pr_refusals(registry, tmp_path, monkeypatch):
+    reg, origin = registry
+    spec = await reg.save({"name": "bot", "url": str(origin)})
+    ro, _ = await reg.create_worktree(spec, "topic-pr0002", "Read", write=False)
+    with pytest.raises(RepoError, match="editable"):
+        await gitrepo.create_pr(ro, "t", "b")
+    mr, _ = await reg.create_worktree(spec, "topic-pr0003", "Empty", write=True)
+    with pytest.raises(RepoError, match="no commits"):
+        await gitrepo.create_pr(mr, "t", "b")
+    await gitrepo.write_file(mr, "a.md", "x")
+    await gitrepo.commit(mr, "docs: a note", "Scribe")
+    with pytest.raises(RepoError, match="GitHub and Azure DevOps"):  # origin is a local bare repo
+        await gitrepo.create_pr(mr, "t", "b")
+    assert mr.pushed is None  # nothing pushed when no PR is possible
+
+    async def fake_remote(_mr):
+        return "https://github.com/acme/bot.git"
+    monkeypatch.setattr(gitrepo, "remote_url", fake_remote)
+    monkeypatch.setattr(gitrepo, "GH_BIN", str(tmp_path / "no-such-gh"))
+    with pytest.raises(RepoError, match="not found"):
+        await gitrepo.create_pr(mr, "t", "b")
+
+
 # ------------------------------------------------------------------ e2e
 def _free_port() -> int:
     with socket.socket() as s:
@@ -191,6 +317,12 @@ async def test_mission_with_editable_repo(server):
         report = (await http.get(f"{base}/api/topics/{topic_id}/report")).json()
         tools = {c["name"] for r_ in report["rounds"] for a in r_["artifacts"] for c in a["tool_calls"]}
         assert {"repo_info", "write_file", "repo_commit"} <= tools
+
+        assert code["pr_host"] is None  # local bare origin → no PR button
+        draft = (await http.get(f"{base}/api/topics/{topic_id}/repos/bot/pr")).json()
+        assert draft["title"] == "Transcript topic" and draft["base"] == "main" and "## Commits" in draft["body"]
+        r = await http.post(f"{base}/api/topics/{topic_id}/repos/bot/pr", json={"title": "x"})
+        assert r.status_code == 400 and "GitHub and Azure DevOps" in r.json()["detail"]
 
         r = await http.post(f"{base}/api/topics/{topic_id}/repos/bot/push")
         assert r.status_code == 200 and code["branch"] in sh("branch", "--list", cwd=origin)

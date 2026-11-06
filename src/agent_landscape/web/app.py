@@ -367,6 +367,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     entry["changed"] = mr.changed
                     entry["stat"] = await gitrepo.diff(mr, stat=True)
                     entry["diff"] = await gitrepo.diff(mr)
+                    entry["pr_host"] = (gitrepo.pr_target(await gitrepo.remote_url(mr)) or {}).get("host")
                 except ValueError as exc:
                     entry["error"] = str(exc)
             out.append(entry)
@@ -383,6 +384,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         runtime.log(f"📦 Pushed {mr.branch} of {mr.name} to origin", topic_id=topic_id, level="success")
         runtime.repo_changed(topic_id, mr, by="you")
         return {"ok": True, "output": out, "pushed": mr.pushed}
+
+    def _pr_body(topic, mr) -> str:
+        """Default PR description: the mission deliverable + commit list (the human can edit it before sending)."""
+        commits = "\n".join(f"- `{c['sha']}` {c['message']} ({c['author']})" for c in mr.commits)
+        result = (topic.result or "").strip() if topic else ""
+        if len(result) > 20_000:
+            result = result[:20_000] + "\n\n… (truncated – full report in Agent Landscape)"
+        parts = [f"## Mission\n{topic.title}" if topic else "", f"## Summary\n{result}" if result else "",
+                 f"## Commits\n{commits}" if commits else "",
+                 "---\n_Opened from Agent Landscape. Commits were written by agents on a mission branch and reviewed "
+                 "by a human before this PR._"]
+        return "\n\n".join(p for p in parts if p)
+
+    @app.get("/api/topics/{topic_id}/repos/{name}/pr")
+    async def pr_draft(topic_id: str, name: str):
+        """Prefilled title/body for the PR dialog."""
+        mr = _mission_repo(topic_id, name)
+        topic = runtime.topics.get(topic_id)
+        return {"title": topic.title if topic else mr.branch, "body": _pr_body(topic, mr),
+                "base": gitrepo.base_branch(mr), "branch": mr.branch, "pr": mr.pr,
+                "host": (gitrepo.pr_target(await gitrepo.remote_url(mr)) or {}).get("host")}
+
+    @app.post("/api/topics/{topic_id}/repos/{name}/pr")
+    async def create_pr(topic_id: str, name: str, body: dict | None = None):
+        """Human approval step: push (if needed) + open a pull request with the user's gh / az login."""
+        mr = _mission_repo(topic_id, name)
+        topic = runtime.topics.get(topic_id)
+        body = body or {}
+        try:
+            pr = await gitrepo.create_pr(mr, str(body.get("title") or (topic.title if topic else "")),
+                                         str(body.get("body") or _pr_body(topic, mr)), draft=bool(body.get("draft")))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        verb = "Found open" if pr.get("existing") else "Opened"
+        runtime.log(f"🔀 {verb} pull request {pr['url']} for {mr.name}", topic_id=topic_id, level="success")
+        runtime.repo_changed(topic_id, mr, by="you")
+        return {"ok": True, "pr": pr, "pushed": mr.pushed}
 
     @app.post("/api/context/convert")
     async def convert_document(request: Request, name: str):
