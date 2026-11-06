@@ -141,6 +141,24 @@ agents:
 **Use LiteLLM-hosted agents.** In **🤝 Allies**, recruit `http://localhost:4000/a2a/<agent>` with your LiteLLM key.
 Orchestrators can then assign subtasks to it (`"strategy": "ally"`).
 
+### Claude Code (local, opt-in – prototype)
+
+**For subscription users without an API key.** If you have a Claude Code seat (e.g. Enterprise) but no Anthropic API key,
+agents can use Claude through the official `claude` CLI under your own login. LiteLLM keeps only the official routes
+(keys, Bedrock, Vertex, Azure); this provider runs locally inside Agent Landscape.
+
+- **Setup:** install the `claude` CLI and log in once (`claude` → `/login`). Set `CLAUDE_CODE_ENABLED=1` and pick models
+  such as `claude-code/sonnet` (mission model, profile model or `DEFAULT_MODEL`).
+- **Local only:** the server refuses to start when `HOST` is not loopback, unless `CLAUDE_CODE_ALLOW_REMOTE=1`.
+  Never expose it as a shared service – it is your personal seat.
+- **Locked down:** Claude Code's built-in tools and MCP are disabled, the CLI runs in an empty temp dir, and
+  `ANTHROPIC_API_KEY` is stripped from the child env.
+- **Limitations:** no landscape tools (text only), no streaming, and the seat's quota is shared by every agent using it.
+  Cost shows as $0 (subscription).
+
+Why this lives here and not in LiteLLM: see [ADR-0001](docs/adr/0001-claude-code-local-provider.md). Check with your
+Claude admin that headless use of your seat is allowed.
+
 ## Mission briefing: context & tools
 
 Press **N** (or **⚔️ New mission briefing**) to open the briefing composer. Like Copilot Chat, you can attach context
@@ -279,6 +297,12 @@ Everything survives a restart: regions, missions (incl. feedback rounds, intel, 
 | `DEFAULT_MODEL` / `ORCHESTRATOR_MODEL` | `gpt-4o-mini` / – | LiteLLM model names |
 | `LITELLM_PROXY_URL` / `LITELLM_PROXY_API_KEY` | – | Route all calls through a LiteLLM Proxy |
 | `MOCK_LLM` | `auto` | `auto` = mock unless a proxy or provider key is configured |
+| `CLAUDE_CODE_ENABLED` | off | Enable the local `claude-code/*` provider (see *Claude Code* above) |
+| `CLAUDE_CODE_BIN` | `claude` | Path to the `claude` CLI |
+| `CLAUDE_CODE_MODELS` | `sonnet,opus,haiku` | Models offered as `claude-code/<name>` |
+| `CLAUDE_CODE_TIMEOUT` | `300` | Seconds per CLI call |
+| `CLAUDE_CODE_CONCURRENCY` | `2` | Max parallel CLI processes |
+| `CLAUDE_CODE_ALLOW_REMOTE` | off | Allow the provider when `HOST` is not loopback (not recommended) |
 | `MAX_DEPTH` / `MAX_SUBTASKS` | `3` / `4` | Hierarchy depth and plan width |
 | `DEFAULT_SWARM_SIZE` / `MAX_SWARM_SIZE` / `MAX_AGENTS` | `3` / `6` / `80` | Swarm and safety limits |
 

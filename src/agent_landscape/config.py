@@ -24,6 +24,13 @@ def _int(name: str, default: int) -> int:
         return default
 
 
+def _bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _db_path(raw: str) -> str | None:
     raw = raw.strip()
     if raw.lower() in ("", "off", "none", "false", "0"):
@@ -66,6 +73,14 @@ class Settings:
     profiles_dir: str | None = None
     # skill roots (folders containing <skill>/SKILL.md)
     skills_dirs: list[str] = field(default_factory=list)
+    # local, opt-in claude-code/* provider: runs the user's own `claude` CLI on their subscription seat
+    # (no Anthropic API key). Personal-seat only → loopback hosts unless explicitly overridden.
+    claude_code_enabled: bool = False
+    claude_code_bin: str = "claude"
+    claude_code_models: list[str] = field(default_factory=lambda: ["sonnet", "opus", "haiku"])
+    claude_code_timeout: int = 300
+    claude_code_concurrency: int = 2
+    claude_code_allow_remote: bool = False
     extra: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -77,13 +92,15 @@ class Settings:
     def from_env(cls, **overrides) -> "Settings":
         load_dotenv()
         proxy_url = os.getenv("LITELLM_PROXY_URL") or None
+        claude_code_enabled = _bool("CLAUDE_CODE_ENABLED")
         mock_env = os.getenv("MOCK_LLM", "auto").strip().lower()
         if mock_env in ("1", "true", "yes", "on"):
             mock = True
         elif mock_env in ("0", "false", "no", "off"):
             mock = False
         else:
-            mock = not (proxy_url or any(os.getenv(k) for k in _PROVIDER_KEYS))
+            mock = not (proxy_url or claude_code_enabled or any(os.getenv(k) for k in _PROVIDER_KEYS))
+        claude_code_models = [m.strip() for m in os.getenv("CLAUDE_CODE_MODELS", "").split(",") if m.strip()]
 
         values = dict(
             host=os.getenv("HOST", "127.0.0.1"),
@@ -110,6 +127,12 @@ class Settings:
                           else str(Path(os.getenv("PROFILES_DIR") or "profiles").expanduser().resolve())),
             skills_dirs=[str(Path(p).expanduser().resolve()) for p in
                          os.getenv("SKILLS_DIRS", "skills:.github/skills:.claude/skills").split(os.pathsep) if p.strip()],
+            claude_code_enabled=claude_code_enabled,
+            claude_code_bin=os.getenv("CLAUDE_CODE_BIN") or "claude",
+            claude_code_models=claude_code_models or ["sonnet", "opus", "haiku"],
+            claude_code_timeout=_int("CLAUDE_CODE_TIMEOUT", 300),
+            claude_code_concurrency=max(1, _int("CLAUDE_CODE_CONCURRENCY", 2)),
+            claude_code_allow_remote=_bool("CLAUDE_CODE_ALLOW_REMOTE"),
         )
         roots = [r.strip() for r in os.getenv("CONTEXT_ROOTS", "").split(os.pathsep) if r.strip()]
         if roots:

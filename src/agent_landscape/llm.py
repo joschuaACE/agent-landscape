@@ -5,15 +5,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import shutil
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import litellm
 
 from .config import Settings
 
+if TYPE_CHECKING:
+    from .claude_code import ClaudeCodeRunner
+
 log = logging.getLogger(__name__)
+CLAUDE_CODE_PREFIX = "claude-code/"
 litellm.drop_params = True  # e.g. drop `temperature` for models that reject it
 litellm.suppress_debug_info = True
 
@@ -32,6 +37,8 @@ class LLMResult:
     cost: float = 0.0
     model: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
+    # what the call *would* have cost on the API (subscription seats report it, but nobody pays it)
+    notional_cost: float = 0.0
 
     def assistant_message(self) -> dict[str, Any]:
         """The assistant turn to append before tool results (OpenAI format)."""
@@ -45,12 +52,26 @@ class LLM:
         self.settings = settings
         # models that rejected `temperature` (e.g. reasoning models behind a LiteLLM proxy)
         self._no_temperature: set[str] = set()
+        self._claude_code: ClaudeCodeRunner | None = None  # created on first real claude-code/* call
 
     def resolve_model(self, model: str | None) -> str:
         m = model or self.settings.default_model
-        if self.settings.proxy_url and not self.settings.mock and not m.startswith("litellm_proxy/"):
+        if (self.settings.proxy_url and not self.settings.mock
+                and not m.startswith(("litellm_proxy/", CLAUDE_CODE_PREFIX))):
             m = f"litellm_proxy/{m}"
         return m
+
+    async def _complete_claude_code(self, messages: list[dict[str, Any]], model: str,
+                                    tools: list[dict[str, Any]] | None) -> LLMResult:
+        """Route claude-code/* to the local CLI runner – never to LiteLLM (it has no such provider)."""
+        if not self.settings.claude_code_enabled:
+            raise RuntimeError("claude-code/* models need CLAUDE_CODE_ENABLED=1 (local Claude Code CLI provider); "
+                               f"refusing to send {model} to LiteLLM")
+        if self._claude_code is None:
+            from .claude_code import ClaudeCodeRunner  # lazy: claude_code imports this module
+
+            self._claude_code = ClaudeCodeRunner(self.settings)
+        return await self._claude_code.complete(messages, model, tools)
 
     async def complete(
         self,
@@ -64,8 +85,11 @@ class LLM:
         tools: list[dict[str, Any]] | None = None,
     ) -> LLMResult:
         s = self.settings
+        resolved = self.resolve_model(model)
+        if not s.mock and resolved.startswith(CLAUDE_CODE_PREFIX):
+            return await self._complete_claude_code(messages, resolved, tools)
         kwargs: dict[str, Any] = {
-            "model": self.resolve_model(model),
+            "model": resolved,
             "messages": messages,
             "temperature": temperature,
         }
@@ -76,9 +100,9 @@ class LLM:
         if s.mock:
             await asyncio.sleep(random.uniform(*s.mock_delay))
             kwargs["mock_response"] = mock or "Acknowledged. Task analysed and completed."
-            if "/" not in kwargs["model"]:
-                # proxy-only names (e.g. "bc2_claude-haiku-5-5") have no provider LiteLLM can infer;
-                # mock calls never reach a provider, so any one will do
+            if "/" not in kwargs["model"] or kwargs["model"].startswith(CLAUDE_CODE_PREFIX):
+                # proxy-only names (e.g. "bc2_claude-haiku-5-5") and claude-code/* have no provider
+                # LiteLLM can infer; mock calls never reach a provider, so any one will do
                 kwargs["custom_llm_provider"] = "openai"
         else:
             if s.proxy_url:
@@ -146,23 +170,44 @@ class LLM:
             log.warning("Could not list LiteLLM proxy models: %s", exc)
             return None
 
+    def claude_code_models(self) -> list[str]:
+        s = self.settings
+        return [f"{CLAUDE_CODE_PREFIX}{m}" for m in s.claude_code_models] if s.claude_code_enabled else []
+
     async def list_models(self) -> list[str]:
         proxy = await self.proxy_models()
         if proxy is not None:  # only offer names the proxy can actually serve
-            return sorted(proxy)
+            return sorted(proxy) + self.claude_code_models()
         s = self.settings
-        return list(dict.fromkeys(m for m in (s.default_model, s.orchestrator_model) if m))
+        return list(dict.fromkeys([*(m for m in (s.default_model, s.orchestrator_model) if m),
+                                   *self.claude_code_models()]))
+
+    def _claude_code_problems(self) -> list[str]:
+        """Setup problems of the local claude-code/* provider – independent of any LiteLLM proxy."""
+        s = self.settings
+        if not s.claude_code_enabled:
+            return []
+        from .claude_code import remote_problem  # lazy: claude_code imports this module
+
+        problems: list[str] = []
+        if shutil.which(s.claude_code_bin) is None:
+            problems.append(f"CLAUDE_CODE_ENABLED=1 but the claude CLI was not found: CLAUDE_CODE_BIN={s.claude_code_bin}")
+        remote = remote_problem(s)
+        if remote:
+            problems.append(remote)
+        return problems
 
     async def check_models(self) -> list[str]:
-        """Explain configured model names the LiteLLM proxy can't serve (empty list = all good)."""
+        """Explain configured model names the LiteLLM proxy (or the claude-code/* provider) can't serve
+        (empty list = all good)."""
+        problems = self._claude_code_problems()
         proxy = await self.proxy_models()
         if proxy is None:
-            return []
+            return problems
         s = self.settings
-        problems: list[str] = []
         for var, name in (("DEFAULT_MODEL", s.default_model), ("ORCHESTRATOR_MODEL", s.orchestrator_model)):
             bare = (name or "").removeprefix("litellm_proxy/")
-            if not bare or bare in proxy:
+            if not bare or bare in proxy or bare.startswith(CLAUDE_CODE_PREFIX):  # claude-code/* never hits the proxy
                 continue
             public = [p for p, under in proxy.items() if under and under.split("/")[-1] == bare.split("/")[-1]]
             if public:
