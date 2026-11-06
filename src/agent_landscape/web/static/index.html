@@ -123,7 +123,11 @@
               <option value="">default</option>
             </select>
             <h4>MODEL</h4>
-            <select name="model" title="LiteLLM model for this mission (overrides the profile's model)"><option value="">default model</option></select>
+            <select name="model" title="Default: profile models, else DEFAULT_MODEL · a model: forced for every agent · Auto: the orchestrator picks per subtask from the pool"><option value="">default model</option></select>
+            <div id="cp-model-pool" class="cp-model-pool" hidden>
+              <small class="muted">Pool – the orchestrator picks a model per subtask by complexity:</small>
+              <div class="cp-pool-list"></div>
+            </div>
             <h4>SWARM SIZE</h4>
             <label class="slider"><input type="range" name="swarm_size" min="2" max="6" value="3"><output id="swarm-size-out">3</output></label>
             <h4>INTEL</h4>

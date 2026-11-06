@@ -271,6 +271,15 @@ Every agent type (orchestrator, each specialist, hive leader, each swarm persona
 - **Tool access** by family (`intel`, `files`, `knowledge`, `knowledge_admin`, `mcp`, `skills`), plus `grant_mcp` for always-on
   LiteLLM MCP servers (read-only tools). It is enforced on every call, not only hidden from the tool list.
 - **Model precedence:** mission model > profile model > `ORCHESTRATOR_MODEL` (orchestrators) > `DEFAULT_MODEL`.
+- **Model choice per mission** (briefing → *MODEL*):
+  - **default**: each profile's model, else `DEFAULT_MODEL`.
+  - **a model**: forced for every agent of the mission.
+  - **🧠 Auto**: tick a **pool** of models. Orchestrators (and captains) assign a `model` per subtask by complexity,
+    e.g. a small model for lookups and summaries, a strong one for architecture, code and reviews. Picks outside the
+    pool are ignored. `claude-code/*` models are unticked by default and marked *no tools*. The assignment is logged,
+    and every artifact in the report shows the model it ran on. Over A2A: `metadata.model = "auto"` and optionally
+    `metadata.model_pool = [...]` (default: all offered models).
+  - A model pinned on a unit (Unit panel) always wins.
 - **Traceability:** each A2A task records `profile`, `profile_rev` (content hash) and `skills_used`. The report's 🧩 Artifacts tab shows
   which instructions produced which output.
 
