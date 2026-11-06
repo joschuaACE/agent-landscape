@@ -325,6 +325,10 @@ You can register repos and attach them to a mission, e.g. a Copilot Studio solut
     `az extension add --name azure-devops`). The repo is taken from the worktree's own `origin`, so every registered
     repo targets its own host. Title and description are prefilled from the mission (deliverable + commits) and editable;
     an already open PR for the branch is reused. Other hosts: push and open the PR by hand.
+  - **Several GitHub accounts** (e.g. one per client/org): use an SSH host alias in the repo URL for the push
+    (`git@github-client:org/repo.git`, see `~/.ssh/config`) and set `gh_user: <account>` on the repo in `repos.yaml`.
+    Log that account into gh once (`gh auth login`); PRs then run as that account via `gh auth token --user` –
+    no `gh auth switch`.
     `GH_BIN` / `AZ_BIN` override the CLI paths.
 - **Leftovers and cleanup:**
   - Uncommitted leftovers are auto-committed at the end of a round.

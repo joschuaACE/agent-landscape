@@ -19,7 +19,7 @@ from agent_landscape.config import Settings
 from agent_landscape.context import repos as gitrepo
 from agent_landscape.context.intel import MissionIntel
 from agent_landscape.context.mcp import MCPGateway
-from agent_landscape.context.repos import RepoError, RepoRegistry
+from agent_landscape.context.repos import RepoError, RepoRegistry, RepoSpec
 from agent_landscape.context.toolbox import Toolbox
 from agent_landscape.web.app import create_app
 
@@ -143,15 +143,20 @@ async def test_toolbox_repo_tools_respect_profiles(registry):
 
 # ------------------------------------------------------------------ pull requests (fake gh / az)
 FAKE_CLI = """#!{python}
-import json, sys
+import json, os, sys
 from pathlib import Path
 here = Path(__file__).parent
 log = here / "calls.jsonl"
 with log.open("a") as f:
-    f.write(json.dumps(sys.argv) + "\\n")
+    f.write(json.dumps(sys.argv + ["GH_TOKEN=" + os.environ.get("GH_TOKEN", "")]) + "\\n")
 args = sys.argv[1:]
 state = here / "opened"
-if args[:2] == ["pr", "list"]:                      # gh
+if args[:2] == ["auth", "token"]:
+    user = args[args.index("--user") + 1]
+    if user != "datev-bot":
+        sys.exit("no oauth token found for github.com account " + user)
+    print("tok-" + user)
+elif args[:2] == ["pr", "list"]:                      # gh
     print(json.dumps([{{"url": "https://github.com/acme/bot/pull/7", "number": 7}}] if state.exists() else []))
 elif args[:2] == ["pr", "create"]:
     state.touch(); print("Creating pull request...\\nhttps://github.com/acme/bot/pull/7")
@@ -179,7 +184,14 @@ def _calls(fake: Path) -> list[list[str]]:
     import json
 
     log = fake.parent / "calls.jsonl"
-    return [json.loads(ln)[1:] for ln in log.read_text().splitlines()] if log.exists() else []
+    return [json.loads(ln)[1:-1] for ln in log.read_text().splitlines()] if log.exists() else []
+
+
+def _tokens(fake: Path) -> list[str]:
+    import json
+
+    log = fake.parent / "calls.jsonl"
+    return [json.loads(ln)[-1] for ln in log.read_text().splitlines()]
 
 
 @pytest.mark.parametrize(("url", "expected"), [
@@ -237,6 +249,29 @@ async def test_create_pr_github_pushes_then_reuses_open_pr(registry, tmp_path, m
 
     again = await gitrepo.create_pr(mr, "x", "y")
     assert again["existing"] and sum(c[:2] == ["pr", "create"] for c in _calls(gh)) == 1
+
+
+async def test_create_pr_uses_the_repos_gh_account(registry, tmp_path, monkeypatch):
+    mr, _ = await _committed_repo(registry)
+    gh = _fake_cli(tmp_path, "gh")
+    monkeypatch.setattr(gitrepo, "GH_BIN", str(gh))
+
+    async def fake_remote(_mr):
+        return "git@github-datev:datevscm/cdc-agents.git"
+    monkeypatch.setattr(gitrepo, "remote_url", fake_remote)
+    monkeypatch.setattr(gitrepo, "ssh_hostname", lambda h: "github.com")
+
+    mr.gh_user = "someone-else"
+    with pytest.raises(RepoError, match="not logged in as 'someone-else'"):
+        await gitrepo.create_pr(mr, "t", "b")
+    mr.gh_user = "datev-bot"
+    pr = await gitrepo.create_pr(mr, "Teams topic", "Body")
+    assert pr["number"] == 7
+    pr_calls = [tok for c, tok in zip(_calls(gh), _tokens(gh), strict=True) if c[0] == "pr"]
+    assert pr_calls and set(pr_calls) == {"GH_TOKEN=tok-datev-bot"}  # every PR call ran as that account
+    assert RepoSpec.from_data({"name": "x", "url": "git@github.com:a/b.git", "gh_user": "datev-bot"}).gh_user
+    with pytest.raises(RepoError, match="gh_user"):
+        RepoSpec.from_data({"name": "x", "url": "git@github.com:a/b.git", "gh_user": "--evil"})
 
 
 async def test_create_pr_azure_devops(registry, tmp_path, monkeypatch):
