@@ -230,6 +230,26 @@ class Orchestrator(Agent):
                          agent=self, level="warn")
         return self.model
 
+    def _tool_capable(self, model: str | None, prof: Any, st: dict[str, Any]) -> str | None:
+        """A repo-editing specialist on a tool-less claude-code/* model can't change anything (it would only
+        *describe* edits). Swap to a gateway model from the pool; if there is none, warn loudly."""
+        rt = self.runtime
+        repos = getattr(rt.intel.get(self.topic_id), "repos", [])
+        if "repo_write" not in prof.tools or not any(r.write for r in repos):
+            return model
+        effective = model or prof.model or rt.settings.default_model
+        if not str(effective).startswith("claude-code/"):
+            return model
+        title = str(st.get("title") or "Subtask")[:40]
+        gateway = [m for m in self._pool() if not m.startswith("claude-code/")]
+        if gateway:
+            rt.log(f"{self.name}: '{title}' edits a repo – {effective} has no tools, using {gateway[0]}",
+                   agent=self, level="warn")
+            return gateway[0]
+        rt.log(f"{self.name}: '{title}' edits a repo but runs on {effective} (no tools) – it can't change files. "
+               "Pick a gateway model (or add one to the Auto pool).", agent=self, level="error")
+        return model
+
     def _child_for(self, st: dict[str, Any]) -> Agent:
         s = self.runtime.settings
         model = self._pick_model(st)
@@ -254,8 +274,10 @@ class Orchestrator(Agent):
             allowed = [w.key for w in self._workers()]
             if allowed and wanted not in allowed:  # team missions only use their members
                 wanted = allowed[0]
-            specialty = self.runtime.profiles.resolve(wanted, "worker", allowed[0] if allowed else "researcher").key
+            prof = self.runtime.profiles.resolve(wanted, "worker", allowed[0] if allowed else "researcher")
+            specialty = prof.key
             cls, kwargs = Worker, {"specialty": specialty}
+            model = self._tool_capable(model, prof, st)
         # prefer an idle veteran (own team first, then this region) over a fresh recruit
         rt = self.runtime
         veteran = rt.find_veteran(cls, region_id=rt.topics[self.topic_id].region_id, parent=self,

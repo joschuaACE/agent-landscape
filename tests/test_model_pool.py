@@ -41,6 +41,27 @@ def test_pick_model_only_accepts_pool_models() -> None:
     assert Orchestrator._pick_model(orch, {"model": "big-model"}) == "fixed"
 
 
+def test_repo_editors_never_run_tool_less_when_pool_has_a_gateway_model() -> None:
+    logs: list[tuple[str, str]] = []
+    pool = ["claude-code/opus", "gpt-x"]
+    rt = SimpleNamespace(topics={"t": SimpleNamespace(model_pool=pool)},
+                         intel={"t": SimpleNamespace(repos=[SimpleNamespace(write=True)])},
+                         settings=SimpleNamespace(default_model="claude-code/haiku"),
+                         log=lambda msg, level="info", **_: logs.append((level, msg)))
+    orch = SimpleNamespace(runtime=rt, topic_id="t", name="Orch")
+    orch._pool = lambda: Orchestrator._pool(orch)
+    engineer = SimpleNamespace(tools=["files", "repo", "repo_write"], model=None)
+    scout = SimpleNamespace(tools=["files", "repo"], model=None)
+    st = {"title": "Implement topic"}
+    assert Orchestrator._tool_capable(orch, "claude-code/opus", engineer, st) == "gpt-x"
+    assert Orchestrator._tool_capable(orch, None, engineer, st) == "gpt-x"  # default is claude-code too
+    assert Orchestrator._tool_capable(orch, "claude-code/opus", scout, st) == "claude-code/opus"  # no repo edits
+    assert Orchestrator._tool_capable(orch, "gpt-x", engineer, st) == "gpt-x"
+    rt.topics["t"].model_pool = ["claude-code/opus"]
+    assert Orchestrator._tool_capable(orch, "claude-code/opus", engineer, st) == "claude-code/opus"
+    assert logs[-1][0] == "error" and "can't change files" in logs[-1][1]
+
+
 def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
