@@ -54,6 +54,8 @@ def _entry(task: Task, rt: "Runtime") -> dict[str, Any]:
         "finished_at": finished,
         "duration": round(finished - started, 1) if started and finished else None,
         "tokens": md.get("tokens", 0),
+        "cache_read_tokens": md.get("cache_read_tokens", 0),
+        "cache_write_tokens": md.get("cache_write_tokens", 0),
         "cost": md.get("cost", 0.0),
         "model": md.get("model"),
         "profile": md.get("profile"),
@@ -112,6 +114,8 @@ def build_report(rt: "Runtime", topic: "Topic") -> dict[str, Any]:
             "finished_at": head["finished_at"] if head else None,
             "duration": head["duration"] if head else None,
             "tokens": sum(e["tokens"] or 0 for e in entries) + (head["tokens"] if head else 0),
+            **{k: sum(e[k] or 0 for e in entries) + (head[k] if head else 0)
+               for k in ("cache_read_tokens", "cache_write_tokens")},
             "cost": round(sum(e["cost"] or 0 for e in entries) + (head["cost"] if head else 0), 6),
             "artifacts": artifacts,
         })

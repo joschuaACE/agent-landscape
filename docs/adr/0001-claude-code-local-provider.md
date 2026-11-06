@@ -1,6 +1,6 @@
 # ADR-0001: Run Claude Code as a local, opt-in model provider – not on the LiteLLM gateway
 
-- **Status:** Accepted (prototype)
+- **Status:** Accepted (prototype, verified against real CLI 2.1.311)
 - **Date:** 2026-11-06
 - **Deciders:** human owner, Architect Kilo-2 (draft), Orchestrator India-2, integrator
 
@@ -25,7 +25,7 @@
 ## Decision
 **LiteLLM hosts only official routes** (API keys, Bedrock, Vertex, Azure). `claude-code/*` is a **local, opt-in,
 loopback-only** provider inside agent-landscape. It drives the official `claude` CLI under the user's own login
-(option B). It is off unless `CLAUDE_CODE_ENABLED=1`. It refuses to start when `HOST` is not loopback unless
+(option B). It is off unless `CLAUDE_CODE_ENABLED=1`. It refuses calls when `HOST` is not loopback unless
 `CLAUDE_CODE_ALLOW_REMOTE=1`. It runs the CLI with built-in tools and MCP disabled, in an empty temp dir, with
 `ANTHROPIC_API_KEY` stripped from the child env. This keeps the personal seat personal (rules out A), stays within the
 official client (rules out D) and can ship now without new hosting (C later).
@@ -38,5 +38,26 @@ official client (rules out D) and can ship now without new hosting (C later).
 - ⚠️ **The seat's quota is shared** by every agent that uses it. Large swarms can exhaust it.
 - ⚠️ **Each call spawns a process.** Latency is not yet measured.
 - ⚠️ **CLI flags are a moving target.** Pin and re-check the `claude` version when it changes.
-- ❓ **Open policy question:** whether headless use of an Enterprise seat is allowed. Confirm with your Claude admin before using it for real.
-- 🔜 MCP bridge for landscape tools (Agent SDK in-process MCP server), streaming, latency measurement, revisit option C.
+- ✅ **Policy resolved (2026-11-06):** the company approved headless use of the Enterprise seat by a local tool
+  (`claude -p`) for local, personal use. Shared/hosted use stays out of scope, so the loopback guard stays.
+- 🔜 MCP bridge for landscape tools (own ADR), streaming (`stream-json`), UI badge "subscription · notional $", revisit option C.
+- ✖️ Session reuse (`--resume`) dropped: the 1-hour prompt cache gives most of the benefit without state on disk.
+
+## Update 2026-11-06 – owner decisions after the real smoke test
+1. **Token rule:** for `claude-code/*`, `tokens` = **input + output only**. Cache read/write tokens are kept as
+   `cache_read_tokens` / `cache_write_tokens`, shown separately and **not** added to totals or XP. The LiteLLM path is
+   unchanged, so counts are not directly comparable with gateway models.
+2. **User `~/.claude` is blocked:** the runner always passes `--setting-sources project` (cwd = empty temp dir), so
+   user CLAUDE.md/memory and `settings.json` (`env`, `apiKeyHelper`, `hooks`) are not loaded; managed policy applies.
+   Rejected alternatives: `--bare` (API-key auth only), overriding `HOME` / `CLAUDE_CONFIG_DIR` (loses the seat login).
+3. **Hardening:** strip `ANTHROPIC_*` / `CLAUDE_CODE_USE_*` by prefix, `DISABLE_AUTOUPDATER=1`, `--no-session-persistence`,
+   process-group kill on timeout and cancel, error JSON preferred over exit codes (`is_error`, `api_error_status`),
+   oversized system prompts moved to stdin, agents on `claude-code/*` are told they have no tools.
+
+## Verification log
+| Date | CLI / OS | Check | Result |
+|---|---|---|---|
+| 2026-11-06 | 2.1.311, macOS | `claude --help` | ✅ `--tools`, `--system-prompt`, `--setting-sources`, `--no-session-persistence`, `--strict-mcp-config`, `--mcp-config` (variadic) exist |
+| 2026-11-06 | same | owner run, default prompt, `sonnet` | ✅ JSON shape (`result`, `usage`, `total_cost_usd`, `is_error`, `subtype`, `api_error_status`, `modelUsage`) → `tests/fixtures/claude_p_result.json`; `sonnet` → `claude-sonnet-5-5` (firstParty) |
+| 2026-11-06 | same | `python -m agent_landscape.claude_code haiku` (runner argv) | ✅ `PONG`, 7 tokens, cache write 594 (vs 1873 with the default prompt → `--system-prompt` replaces it), ~1.2 s, `claude-haiku-5-5`, no session folder left |
+| 2026-11-06 | same | init event (`stream-json --verbose`) with runner flags | ✅ `tools: []`, `mcp_servers: []`, `apiKeySource: none` (seat login) |

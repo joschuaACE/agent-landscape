@@ -119,7 +119,8 @@ class Agent:
 
     async def execute(self, ctx: TaskContext) -> None:
         token = _litellm_headers.set(ctx.litellm_headers)
-        usage: dict[str, Any] = {"tokens": 0, "cost": 0.0, "model": None, "topic_id": ctx.task.context_id}
+        usage: dict[str, Any] = {"tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "cost": 0.0,
+                                 "model": None, "topic_id": ctx.task.context_id}
         usage_token = _task_usage.set(usage)
         ctx.task.metadata = {**(ctx.task.metadata or {}), "agent_name": self.name, "role": self.role,
                              "icon": self.icon, "title": self.title,
@@ -156,6 +157,9 @@ class Agent:
         finally:
             _litellm_headers.reset(token)
             _task_usage.reset(usage_token)
+            if usage["cache_read_tokens"] or usage["cache_write_tokens"]:
+                ctx.task.metadata.update(cache_read_tokens=usage["cache_read_tokens"],
+                                         cache_write_tokens=usage["cache_write_tokens"])
             ctx.task.metadata.update(tokens=usage["tokens"], cost=round(usage["cost"], 6), model=usage["model"],
                                      tool_calls=usage.get("tool_calls", []), skills_used=list(self.skills_used),
                                      finished_at=time.time())
@@ -197,6 +201,13 @@ class Agent:
         if temperature is None:
             temperature = prof.temperature if prof is not None and prof.temperature is not None else 0.7
         model = self.pinned_model or model or self.model or (prof.model if prof is not None else None)
+        settings = self.runtime.settings
+        if use_tools and not settings.mock and (model or settings.default_model).startswith("claude-code/"):
+            # the local Claude Code CLI runs without landscape tools – don't advertise tools it can't call
+            # (the model would otherwise "describe" tool calls or invent their results)
+            use_tools = False
+            system += ("\n\n---\nNote: you have NO tools in this run. Answer only from the context given here; "
+                       "if something can't be known from it, say so instead of guessing.")
         prev = (self.status, self.activity)
         self.set_status("thinking", activity)
         if self.memory and not self.persistent:
@@ -277,6 +288,9 @@ class Agent:
         usage = _task_usage.get()
         if usage is not None:
             usage["tokens"] += res.tokens
+            # cache traffic is shown per task, but never feeds XP or runtime/topic token totals
+            usage["cache_read_tokens"] += getattr(res, "cache_read_tokens", 0)
+            usage["cache_write_tokens"] += getattr(res, "cache_write_tokens", 0)
             usage["cost"] += res.cost
             usage["model"] = res.model
         self.runtime.add_usage(res.tokens, res.cost, topic_id=usage["topic_id"] if usage else self.topic_id)

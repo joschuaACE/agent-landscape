@@ -39,6 +39,10 @@ class LLMResult:
     tool_calls: list[ToolCall] = field(default_factory=list)
     # what the call *would* have cost on the API (subscription seats report it, but nobody pays it)
     notional_cost: float = 0.0
+    # prompt-cache traffic, shown next to `tokens` but NOT included in it (claude-code/* only for now;
+    # the LiteLLM path leaves these 0 – its total_tokens may already contain cached prompt tokens)
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
 
     def assistant_message(self) -> dict[str, Any]:
         """The assistant turn to append before tool results (OpenAI format)."""

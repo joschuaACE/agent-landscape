@@ -149,15 +149,31 @@ agents can use Claude through the official `claude` CLI under your own login. Li
 
 - **Setup:** install the `claude` CLI and log in once (`claude` → `/login`). Set `CLAUDE_CODE_ENABLED=1` and pick models
   such as `claude-code/sonnet` (mission model, profile model or `DEFAULT_MODEL`).
-- **Local only:** the server refuses to start when `HOST` is not loopback, unless `CLAUDE_CODE_ALLOW_REMOTE=1`.
-  Never expose it as a shared service – it is your personal seat.
-- **Locked down:** Claude Code's built-in tools and MCP are disabled, the CLI runs in an empty temp dir, and
-  `ANTHROPIC_API_KEY` is stripped from the child env.
-- **Limitations:** no landscape tools (text only), no streaming, and the seat's quota is shared by every agent using it.
-  Cost shows as $0 (subscription).
+  Prefer an absolute `CLAUDE_CODE_BIN` if you start the server from an IDE, launchd or a conda env.
+- **Local only:** `claude-code/*` calls are refused when `HOST` is not loopback, unless `CLAUDE_CODE_ALLOW_REMOTE=1`.
+  Never expose it as a shared service – it is your personal seat. Start the server from a Terminal in your logged-in
+  macOS session (over ssh/launchd the Keychain login may be unavailable).
+- **Locked down:** built-in tools and MCP are disabled, the CLI runs in an empty temp dir without session persistence,
+  all `ANTHROPIC_*` / `CLAUDE_CODE_USE_*` variables are stripped from its env and auto-update is off for the child.
+  A cancelled or timed-out call kills the CLI's whole process group.
+- **Your personal Claude Code setup is ignored:** the runner always passes `--setting-sources project`, so
+  `~/.claude/CLAUDE.md` and `~/.claude/settings.json` (`env`, `apiKeyHelper`, `hooks`) are **not** loaded. Your
+  company's managed policy still applies.
+- **Limitations:** no landscape tools (text only – such agents are told they have no tools), no streaming, and the
+  seat's quota is shared by every agent using it.
+- **Tokens & cost:** `tokens` = input + output only. Prompt-cache traffic is shown separately in reports
+  (`cache … read / … write`) and never counted into totals or XP. Cost is $0 (subscription); the CLI's would-be API
+  price is kept as `notional_cost`. Token counts are therefore not directly comparable with gateway models.
+- **Approved** for local, personal headless use of the Enterprise seat (2026-11-06). Shared/hosted use is out of scope.
 
-Why this lives here and not in LiteLLM: see [ADR-0001](docs/adr/0001-claude-code-local-provider.md). Check with your
-Claude admin that headless use of your seat is allowed.
+**Verify your setup** (one cheap `haiku` call; expect `RESULT: OK`):
+
+```bash
+HOST=127.0.0.1 python -m agent_landscape.claude_code        # prints argv, text, tokens, served model
+CLAUDE_CODE_LIVE=1 pytest tests/test_claude_code.py -k live  # same check as a test
+```
+
+Why this lives here and not in LiteLLM: see [ADR-0001](docs/adr/0001-claude-code-local-provider.md).
 
 ## Mission briefing: context & tools
 
@@ -354,6 +370,7 @@ Everything survives a restart: regions, missions (incl. feedback rounds, intel, 
 | `CLAUDE_CODE_TIMEOUT` | `300` | Seconds per CLI call |
 | `CLAUDE_CODE_CONCURRENCY` | `2` | Max parallel CLI processes |
 | `CLAUDE_CODE_ALLOW_REMOTE` | off | Allow the provider when `HOST` is not loopback (not recommended) |
+| `CLAUDE_CODE_SETTING_SOURCES` | `project` | The CLI's `--setting-sources` (empty = `project`). The default skips `~/.claude/CLAUDE.md` and `~/.claude/settings.json`; including `user` logs a warning |
 | `MAX_DEPTH` / `MAX_SUBTASKS` | `3` / `4` | Hierarchy depth and plan width |
 | `DEFAULT_SWARM_SIZE` / `MAX_SWARM_SIZE` / `MAX_AGENTS` | `3` / `6` / `80` | Swarm and safety limits |
 
