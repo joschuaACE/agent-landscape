@@ -199,6 +199,16 @@ def test_pr_target(url, expected):
     assert gitrepo.pr_target(url) == expected
 
 
+def test_pr_target_resolves_ssh_host_alias(monkeypatch):
+    """One SSH key per GitHub account via ~/.ssh/config aliases (Host github-datev → github.com)."""
+    monkeypatch.setattr(gitrepo, "ssh_hostname", lambda h: {"github-datev": "github.com"}.get(h, h))
+    assert gitrepo.pr_target("git@github-datev:datevscm/cdc-agents.git") == {"host": "github",
+                                                                            "repo": "datevscm/cdc-agents"}
+    assert gitrepo.pr_target("ssh://git@github-datev/datevscm/cdc-agents") == {"host": "github",
+                                                                              "repo": "datevscm/cdc-agents"}
+    assert gitrepo.pr_target("git@gitlab-work:acme/bot.git") is None
+
+
 async def _committed_repo(registry, name="bot"):
     reg, origin = registry
     spec = await reg.save({"name": name, "url": str(origin)})
