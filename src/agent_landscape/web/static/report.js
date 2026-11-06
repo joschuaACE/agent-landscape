@@ -68,7 +68,14 @@ export function createReportView({ el, store, api, toast, map, onInspect, onChan
     timer = setTimeout(() => { timer = null; load(); }, 700);
   }
 
-  function setTab(tab) { s.tab = tab; render(); }
+  function setTab(tab) { s.tab = tab; render(); if (tab === 'code') loadCode(); }
+
+  /** An agent committed / changed files in a mission repo (live event). */
+  let codeTimer = null;
+  function repoChanged(topicId) {
+    if (!s || s.id !== topicId || s.tab !== 'code' || codeTimer) return;
+    codeTimer = setTimeout(() => { codeTimer = null; loadCode(); }, 600);
+  }
 
   // ---------------------------------------------------------------- render
   function render() {
@@ -128,6 +135,7 @@ export function createReportView({ el, store, api, toast, map, onInspect, onChan
       ${tab('input', `📥 Input${d.rounds.length > 1 ? ` & feedback (${d.rounds.length - 1})` : ''}`)}
       ${tab('artifacts', `🧩 Artifacts (${round.artifacts.length})`)}
       ${tab('team', `👥 Team (${d.team.length})`)}
+      ${repoCount(d) ? tab('code', `📦 Code (${repoCount(d)})`) : ''}
       <span class="sep"></span>${rounds}
     </nav>`;
   }
@@ -136,7 +144,64 @@ export function createReportView({ el, store, api, toast, map, onInspect, onChan
     if (s.tab === 'input') return inputTab(d);
     if (s.tab === 'artifacts') return artifactsTab(d, round);
     if (s.tab === 'team') return teamTab(d);
+    if (s.tab === 'code') return codeTab(d);
     return deliverableTab(d, round);
+  }
+
+  // ------------------------------------------------------------------ code
+  const repoCount = (d) => new Set((d.topic.context || []).filter((c) => c.kind === 'repo' && c.ok).map((c) => c.name)).size;
+
+  async function loadCode() {
+    if (!s) return;
+    const id = s.id;
+    try {
+      const res = await fetch(`/api/topics/${id}/repos`);
+      if (!s || s.id !== id || !res.ok) return;
+      s.code = (await res.json()).repos;
+      if (s.tab === 'code') render();
+    } catch { /* retry on next event */ }
+  }
+
+  function diffHtml(diff) {
+    if (!diff) return '<p class="muted small">No changes vs the base commit.</p>';
+    return `<pre class="rv-diff">${diff.split('\n').map((l) => {
+      const cls = l.startsWith('diff --git') ? 'f' : l.startsWith('@@') ? 'h' : l.startsWith('+') && !l.startsWith('+++') ? 'a'
+        : l.startsWith('-') && !l.startsWith('---') ? 'd' : '';
+      return `<span class="${cls}">${esc(l)}</span>`;
+    }).join('\n')}</pre>`;
+  }
+
+  function codeTab() {
+    if (!s.code) { loadCode(); return '<div class="rv-body"><div class="rv-loading">📦 Reading mission branches…</div></div>'; }
+    const cards = s.code.map((r) => {
+      const vs = `vscode://file${r.path.startsWith('/') ? '' : '/'}${encodeURI(r.path)}`;
+      const canPush = r.write && r.commits.length && !(r.pushed && r.pushed.sha === r.commits.at(-1).sha);
+      return `<section class="rv-card">
+        <h4>📦 ${esc(r.name)} · ${r.write ? `✍️ branch <code>${esc(r.branch)}</code>` : '👁 read-only snapshot'}</h4>
+        <dl class="kv" style="margin:0 0 10px">
+          <dt>Base</dt><dd><code>${esc(r.base)}</code> @ ${esc(r.base_sha.slice(0, 8))}</dd>
+          <dt>Worktree</dt><dd><code>${esc(r.path)}</code>${r.exists ? '' : ' (removed)'}</dd>
+          ${r.url ? `<dt>Remote</dt><dd>${esc(r.url)}</dd>` : ''}
+          ${r.pushed ? `<dt>Pushed</dt><dd>✅ ${esc(r.pushed.branch)} @ ${esc(r.pushed.sha)} · ${new Date(r.pushed.at * 1000).toLocaleString()}</dd>` : ''}
+        </dl>
+        <div class="rv-doc-tools" style="justify-content:flex-start">
+          ${r.exists ? `<a class="btn small" href="${vs}" title="Open the mission worktree in VS Code">🧩 Open in VS Code</a>` : ''}
+          ${r.branch ? `<button class="btn small" data-rv="copy-branch" data-branch="${esc(r.branch)}">📋 Branch name</button>` : ''}
+          ${canPush ? `<button class="btn primary small" data-rv="push" data-repo="${esc(r.name)}" title="git push -u origin ${esc(r.branch)} – agents never push">⬆️ Push branch</button>` : ''}
+          <button class="btn small" data-rv="code-refresh">⟳</button>
+        </div>
+        ${r.error ? `<p class="status err">${esc(r.error)}</p>` : ''}
+        ${r.commits.length ? `<h4>COMMITS (${r.commits.length})</h4><ul class="rv-intel">${r.commits.map((c) => `<li>🔖 <span><code>${esc(c.sha)}</code> <b>${esc(c.message)}</b>
+            <br><small>${esc(c.author)} · ${clock(c.at)} · ${c.files.length} file(s): ${c.files.slice(0, 6).map(esc).join(', ')}${c.files.length > 6 ? ' …' : ''}</small></span></li>`).join('')}</ul>`
+          : `<p class="muted small">${r.write ? 'No commits yet.' : 'Read-only – agents researched this repo without changing it.'}</p>`}
+        ${r.write ? `<h4 style="margin-top:12px">DIFF VS BASE ${r.changed?.length ? `(${r.changed.length} files)` : ''}</h4>${diffHtml(r.diff)}` : ''}
+      </section>`;
+    }).join('');
+    return `<div class="rv-body"><div class="rv-doc">
+      <p class="muted small">Every mission works in its own git worktree. Agents commit to the mission branch – review the diff, then push it
+        (or open the worktree in VS Code to amend, test and push yourself). Dismissing the mission removes the worktree; branches with commits stay.</p>
+      ${cards || '<p class="muted">No repositories attached.</p>'}
+    </div></div>`;
   }
 
   function progress(round) {
@@ -174,8 +239,8 @@ export function createReportView({ el, store, api, toast, map, onInspect, onChan
           <button class="btn ghost small" data-rv="goto" data-round="${r.round}">📜 Result</button></div>
         <div class="md">${renderMarkdown(r.input)}</div>
       </li>`).join('');
-    const kindIcon = { file: '📎', path: '📁', url: '🔗', tool: '🔌', note: '📝', store: '📚' };
-    const how = { created: '🆕 created by', linked: '🔗 linked by', region: '🗺️ region archive ·', attached: '📎 attached by' };
+    const kindIcon = { file: '📎', path: '📁', url: '🔗', tool: '🔌', note: '📝', store: '📚', repo: '📦' };
+    const how = { created: '🆕 created by', linked: '🔗 linked by', region: '🗺️ region archive ·', recall: '🧠 recalled by', attached: '📎 attached by' };
     const knowledge = (t.knowledge || []).map((k) => `<li>📚 <span><b>${esc(k.name)}</b>
         <small>${k.files} files · ${how[k.how] || ''} ${esc(k.linked_by || '')}${k.owned ? '' : ' · read-only'}</small>
         ${k.purpose ? `<br><small>${esc(k.purpose)}</small>` : ''}
@@ -303,6 +368,22 @@ export function createReportView({ el, store, api, toast, map, onInspect, onChan
       }
       case 'node': s.task = btn.dataset.task; render(); break;
       case 'inspect': onInspect?.(btn.dataset.agent); break;
+      case 'code-refresh': loadCode(); break;
+      case 'copy-branch':
+        await navigator.clipboard.writeText(btn.dataset.branch);
+        toast('📋', `Copied <code>${esc(btn.dataset.branch)}</code>`);
+        break;
+      case 'push': {
+        if (!confirm(`Push the mission branch of ${btn.dataset.repo} to origin?`)) return;
+        btn.disabled = true;
+        btn.textContent = '⏳ Pushing…';
+        try {
+          const r = await api(`/api/topics/${t.id}/repos/${encodeURIComponent(btn.dataset.repo)}/push`, { method: 'POST' });
+          toast('⬆️', `Pushed <code>${esc(r.pushed.branch)}</code> – open a pull request in your git host`, 'success');
+        } catch { /* toast shown */ }
+        loadCode();
+        break;
+      }
       case 'copy': {
         const text = currentText(btn.dataset.what);
         if (!text) return;
@@ -334,5 +415,5 @@ export function createReportView({ el, store, api, toast, map, onInspect, onChan
     }
   });
 
-  return { open, close, poke, isOpen: () => !!s, openId: () => s?.id || null };
+  return { open, close, poke, repoChanged, isOpen: () => !!s, openId: () => s?.id || null };
 }

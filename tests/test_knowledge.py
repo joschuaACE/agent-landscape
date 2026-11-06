@@ -10,7 +10,7 @@ from agent_landscape.config import Settings
 from agent_landscape.context.intel import Doc, MissionIntel
 from agent_landscape.context.mcp import MCPGateway
 from agent_landscape.context.toolbox import Toolbox
-from agent_landscape.context.vectorstore import MemoryBackend, VectorService, slug
+from agent_landscape.context.vectorstore import MemoryBackend, VectorService, parse_report, recall_briefing, slug
 
 
 class FakeRuntime:
@@ -122,3 +122,48 @@ async def test_archive_into_region_knowledge():
     assert again.id == store.id and store.files == 2
     hits = await v.backend.search(store.id, "graph api transcripts", 3)
     assert hits and "Transcript agent" in hits[0]["text"]
+    # with a full mission report, that report is archived
+    rt.topic.rounds = 2
+    await v.archive(rt.topic, rt.region, report="# Mission Report: Transcript agent\n\nFULL REPORT BODY")
+    assert any("FULL REPORT BODY" in t and "Round: 2" in t for _, t in v.backend.docs[store.id])
+
+
+def test_parse_report_header():
+    text = "# Mission Report: CoPilot Studio\n\n- **Status:** completed  \n- **Region:** 🏜️ Copilot Studio (Desert)  \n"
+    assert parse_report(text) == ("CoPilot Studio", "Copilot Studio")
+    assert parse_report("# Mission Report: X\n- **Region:** Local LLM Models (Volcano)")[1] == "Local LLM Models"
+    assert parse_report("# Mission Report: X\n- **Region:** –  ")[1] is None
+    assert parse_report("just text") == (None, None)
+
+
+async def test_recall_searches_all_region_archives():
+    v = VectorService(MemoryBackend(), prefix="al")
+    a = SimpleNamespace(name="Copilot Studio", biome="desert", kind="domain")
+    b = SimpleNamespace(name="Local LLM", biome="volcano", kind="domain")
+    for region, title, result in ((a, "Transcript topic", "Graph API transcripts per meeting"),
+                                  (b, "Fine tuning", "LoRA fine tuning of local models")):
+        await v.archive(SimpleNamespace(title=title, goal=title, result=result, rounds=1, feedback=[]), region)
+    await v.create("misc", "not an archive")  # non-archive stores are not recalled
+    hits = await v.recall("fine tuning local models with LoRA", limit=3)
+    assert hits and hits[0]["store"].name == "al-local-llm-knowledge"
+    brief = recall_briefing(hits)
+    assert "Recall: related past missions" in brief and "al-local-llm-knowledge" in brief
+    assert await v.recall("", limit=3) == [] and await v.recall("x", limit=0) == []
+
+
+async def test_import_mission_archive(tmp_path):
+    from agent_landscape.runtime.runtime import Runtime
+
+    d = tmp_path / "2026-11-04_2042"
+    d.mkdir()
+    (d / "a.md").write_text("# Mission Report: A\n\n- **Region:** 🏜️ Copilot Studio (Desert)  \n\nTranscripts body")
+    (d / "b.md").write_text("# Mission Report: B\n\n- **Region:** 🌋 Local LLM Models (Volcano)  \n\nLoRA body")
+    (d / "notes.md").write_text("no header")
+    rt = Runtime(Settings(mock=True, mission_archive_dir=str(tmp_path)))
+    out = await rt.import_mission_archive()
+    assert out["imported"] == 2 and out["unparsed"] == ["2026-11-04_2042/notes.md"]
+    assert set(out["stores"]) == {"al-copilot-studio-knowledge", "al-local-llm-models-knowledge"}
+    hits = await rt.vectors.recall("LoRA", limit=2)
+    assert hits[0]["store"].name == "al-local-llm-models-knowledge"
+    assert hits[0]["filename"] == "archive-2026-11-04-2042-b.md"
+    assert len(rt.archive_imported) == 2

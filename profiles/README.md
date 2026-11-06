@@ -13,6 +13,7 @@ icon: 🏛️
 description: Orchestrators pick specialists by this line – keep it specific.
 model: bc2_claude-haiku-5-5    # optional – mission model > profile model > defaults
 temperature: 0.4               # optional
+max_tool_steps: 12             # optional – tool-call rounds per answer (default MAX_TOOL_STEPS=6, max 40)
 tools: [intel, files, knowledge, skills]   # tool families (see below)
 grant_mcp: [tavily_search_mcp] # optional – LiteLLM MCP servers (read-only tools) or "server/tool"
 skills: [architecture-decision-record]     # ["*"] = all repo skills, [] = none
@@ -36,6 +37,11 @@ You are a pragmatic software architect …
 | `knowledge_admin` | Create stores and file documents into them (orchestrators). |
 | `mcp` | MCP tools attached to the mission. |
 | `skills` | Repo skills via `use_skill` / `read_skill_file`. |
+| `repo` | Inspect attached git repos: `repo_info`, `repo_log`, `repo_diff`. |
+| `repo_write` | ✍️ Edit files in **editable** repos and commit to the mission branch (`edit_file`, `write_file`, `delete_file`, `repo_commit`). It never pushes. Orchestrators show these specialists as "✍️ can edit repos". |
+| `checks` | 🧪 `run_check` in a mission repo's worktree: `tests` (pytest), `coverage` (pytest-cov), `lint` (ruff), `dead_code` (vulture). It uses a fixed allow-list and gives agents no shell. Secrets are blanked and `MOCK_LLM=1` is set, but the tests still execute repo code. Needs `uv pip install -e '.[checks]'`. |
+
+**Lifecycle team** (maintains this repo): `code-janitor` 🧹, `coverage-scout` 🔬, `integrator` 🔩, `feature-steward` 🧭 (lead). They share the `agent-landscape-maintenance` skill.
 
 Every tool call is checked against the agent's profile.
 

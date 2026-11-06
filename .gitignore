@@ -4,6 +4,8 @@ __pycache__/
 .env
 mission-archive/
 data/
+# git clones + per-mission worktrees of repos agents work on (repos.yaml itself is versioned)
+workspace/
 .pytest_cache/
 dist/
 *.egg-info/

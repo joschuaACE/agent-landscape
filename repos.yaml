@@ -1,0 +1,20 @@
+# Git repositories agents can work on (managed by agent-landscape – editable by hand)
+repos:
+- name: agent-landscape
+  path: /Users/joschua.brixner/git/agent-landscape
+  description: 'This platform: FastAPI A2A agent landscape with hex-map UI (Python
+    + vanilla JS).'
+  keywords:
+  - agent-landscape
+  - landscape platform
+- name: hive-mind
+  path: /Users/joschua.brixner/git/ai-solutions-hive-mind
+  description: Collection of knowledge for for different projects
+- name: modfac-ai-migration
+  path: /Users/joschua.brixner/git/ai-migration
+  keywords:
+  - ai migration run
+- name: modfac-ai-migration-plan
+  path: /Users/joschua.brixner/git/ai-migration-plan
+  keywords:
+  - ai migration planning

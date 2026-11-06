@@ -161,12 +161,27 @@ Claude admin that headless use of your seat is allowed.
 
 ## Mission briefing: context & tools
 
-Press **N** (or **⚔️ New mission briefing**) to open the briefing composer. Like Copilot Chat, you can attach context
-with the buttons, by typing **`#`**, or by dropping or pasting files:
+Press **N** (or **⚔️ New mission briefing**) to open the briefing composer. The objective stays in focus. Below it, a
+compact **Context** list shows what the agents may use: one row per item, with tools grouped per MCP server. Click a row
+to change it, or **✕** to remove it.
 
-| Attachment | What agents get |
+Everything is added in one **＋ Add context** dialog. Type **`#`** in the objective to open it on a category, or drop
+or paste files straight onto the objective.
+
+- **Categories:** ✨ Suggested · 📦 Repositories · 📚 Knowledge · 🔌 Tools · 📁 Files & folders · 🔗 Web pages. One search box
+  covers repositories, knowledge and tools.
+- **Suggested** lists matches for your title and objective: repo names and keywords, MCP servers you mention, and
+  knowledge bases with matching terms. A 💡 hint under the context list points to them.
+- **Settings appear only when needed.** Ticking a repository reveals *👁 Read-only / ✍️ Edit on a mission branch* and the
+  base branch. A tool server expands to its individual tools; tools that change data are flagged.
+- **Draft selection.** Nothing changes until you press **Apply** (or **⌘↵**). **Cancel** or **Esc** discards the draft.
+- **Registering a repository** is its own screen inside the dialog, so the briefing itself never shows a setup form.
+
+| Context | What agents get |
 |---|---|
-| 📎 **Files** (text, ≤ 1 MB) | The document. Small ones are inlined into every agent's briefing; larger ones are read on demand (`read_intel`). |
+| 📦 **Repository** | An isolated git worktree. See *Git repositories* below. |
+| 📚 **Knowledge** | `kb_search` in the linked vector stores. See *Knowledge bases* below. |
+| 📎 **Files**: text / code / markdown (≤ 1 MB) and **PDF, Word, PowerPoint, Excel** (≤ 25 MB) | The document. Office files and PDFs are converted to Markdown locally with [markitdown](https://github.com/microsoft/markitdown), also when they arrive as A2A `FilePart`s. Scanned PDFs without a text layer are not supported (no OCR). Small documents are inlined into every agent's briefing; larger ones are read on demand (`read_intel`). |
 | 📁 **Folder / path** | Read-only tools `list_dir`, `read_file`, `search_files`, sandboxed to that folder. `.env`, keys, `.git`, `node_modules` … are hidden. Paths must be inside `CONTEXT_ROOTS` (default: your home dir). |
 | 🔗 **URL** | The page is fetched at deploy time and attached as a document. |
 | 🔌 **Tools** | MCP tools from the **LiteLLM MCP gateway** (`/mcp-rest`). Selecting a server attaches its read-only tools. Tools that change data (⚠️) must be picked one by one. |
@@ -207,8 +222,16 @@ With `VECTOR_STORE_URL` / `VECTOR_STORE_KEY` set, agents get **knowledge-base to
 
 - **Provenance:** each store's metadata records `owner: agent-landscape`, purpose, description, region, mission and creating agent.
   Stores created outside Agent Landscape are **read-only** for agents.
-- **Region memory:** completed missions are archived into **`al-<region>-knowledge`**. Every new mission in that region gets it
-  linked automatically, so teams build on earlier work.
+- **Region memory:** completed missions are archived into **`al-<region>-knowledge`**, as the **full mission report**: objective, intel,
+  each agent's input/output and tool calls. Every new mission in that region gets this store linked automatically, so teams build on earlier work.
+- **Recall:** before choosing a region for a new mission, Command HQ runs a semantic search over **all** region archives
+  (`VECTOR_STORE_RECALL`, top 5 by default; `0` turns it off).
+  - The hits guide which region the mission goes to.
+  - The archives they come from are linked to the mission (🧠 *recalled*), including archives from other regions.
+  - The orchestrator's order gets a short *Recall: related past missions* briefing.
+- **Mission archive import:** on startup, exported reports in `mission-archive/**/*.md` (`MISSION_ARCHIVE_DIR`, `off` disables it) are
+  imported into the region knowledge base named in their `Region:` line. Files already imported, with the same path and content, are skipped.
+  Re-run the import with `POST /api/knowledge/import-archive`.
 - **UI:** link bases in the briefing (📚 Knowledge). The report shows which bases a mission used, who created them and which agents searched them.
   `GET /api/knowledge` lists all bases.
 - Mock mode uses an in-memory store and never touches the real service.
@@ -246,6 +269,30 @@ files with `read_skill_file`, which keeps prompts small. Example: `skills/archit
 > uploads repo skills to LiteLLM for other clients is possible later.
 
 See `profiles/README.md` for the file format.
+
+## Git repositories (code missions)
+
+You can register repos and attach them to a mission, e.g. a Copilot Studio solution repo for "add a topic" or "update a workflow".
+
+- **Register** in the briefing with **＋ Add context → 📦 Repositories → ➕ Register repository**, or in `repos.yaml` (`REPOS_FILE`, versioned). A repo has:
+  - a **remote URL**, cloned into `workspace/repos/<name>` with *your* git credentials (credential helper / SSH agent; nothing is stored), or a **local checkout** used in place;
+  - an optional base branch;
+  - a description, which agents read;
+  - keywords. The composer shows 💡 suggestions when your briefing mentions a repo's name or keywords.
+- **Per mission** each repo gets an **isolated `git worktree`** under `workspace/missions/<mission>/<repo>`. Your working copy is never touched. You choose the mode:
+  - **👁 Read**: a detached snapshot. The orchestrator and specialists research it with `list_dir`, `read_file`, `search_files`, `repo_info`, `repo_log` and `repo_diff`.
+  - **✍️ Edit**: a fresh branch `agents/<mission>-<id>`. Specialists whose profile has the `repo_write` family (built-in: 🛠️ Engineer) change files with `edit_file`, `write_file` or `delete_file` and commit with `repo_commit`.
+    - Paths are confined to the worktree; `.git` and secrets are protected.
+    - Commits are authored as `<Agent> (Agent Landscape)`.
+- **Planning:** the orchestrator researches the repo first, then plans with concrete file paths. It hands implementation to ✍️ specialists and reviews with `repo_diff` before it synthesizes.
+- **Review & ship:** the report's **📦 Code** tab shows the branch, commits and the colored diff, with these actions:
+  - **🧩 Open in VS Code**: opens the worktree, so you can amend, test or run `pac`.
+  - **⬆️ Push branch**: a human-only action. Agents never push.
+  - Then open the PR in GitHub or Azure DevOps.
+- **Leftovers and cleanup:**
+  - Uncommitted leftovers are auto-committed at the end of a round.
+  - Feedback rounds reuse the same worktree and branch.
+  - Dismissing the mission removes the worktree. Branches with commits stay.
 
 ## Mission reports
 
@@ -291,9 +338,13 @@ Everything survives a restart: regions, missions (incl. feedback rounds, intel, 
 | `DB_PATH` | `data/landscape.db` | SQLite persistence file, `off` = in-memory only |
 | `PROFILES_DIR` | `profiles` | Your agent profiles (override / extend built-ins), `off` = read-only built-ins |
 | `SKILLS_DIRS` | `skills:.github/skills:.claude/skills` | Skill folders (`:`-separated, first wins on duplicate names) |
+| `REPOS_FILE` | `repos.yaml` | Registry of git repos agents can work on, `off` = disabled |
+| `WORKSPACE_DIR` | `workspace` | Clones + per-mission git worktrees (gitignored) |
 | `HOST` / `PORT` / `PUBLIC_URL` | `127.0.0.1` / `8765` / `http://127.0.0.1:$PORT` | `PUBLIC_URL` is the URL agents use to reach each other |
 | `VECTOR_STORE_URL` / `VECTOR_STORE_KEY` | – | Knowledge bases for agents (see below) |
 | `VECTOR_STORE_PREFIX` / `VECTOR_STORE_PARSER` / `VECTOR_STORE_AUTO_ARCHIVE` | `al` / `markitdown` / `true` | Store name prefix, upload parser, archive finished missions |
+| `VECTOR_STORE_RECALL` / `VECTOR_STORE_RECALL_MIN_SCORE` | `5` / `0` | Related past missions Command HQ recalls for a new mission (0 = off), minimum score |
+| `MISSION_ARCHIVE_DIR` | `mission-archive` | Exported mission reports imported into the region knowledge bases on startup (`off` = disabled) |
 | `DEFAULT_MODEL` / `ORCHESTRATOR_MODEL` | `gpt-4o-mini` / – | LiteLLM model names |
 | `LITELLM_PROXY_URL` / `LITELLM_PROXY_API_KEY` | – | Route all calls through a LiteLLM Proxy |
 | `MOCK_LLM` | `auto` | `auto` = mock unless a proxy or provider key is configured |

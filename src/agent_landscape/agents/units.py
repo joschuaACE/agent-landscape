@@ -12,6 +12,9 @@ from ..a2a.client import A2AClient
 from ..a2a.task_manager import TaskContext
 from ..a2a.types import AgentCard, AgentSkill, Message, result_text
 from ..context.intel import items_from_message
+from ..context.vectorstore import recall_briefing
+from ..ops.proposals import mock_proposal, parse_proposal, proposal_system
+from ..ops.sources import InboxMessage
 from ..runtime.regions import Region, mock_survey, parse_survey, survey_system
 from . import mock
 from .base import Agent, short
@@ -196,6 +199,16 @@ class Orchestrator(Agent):
     def _prof(self) -> Any:
         return self.profile or self.runtime.profiles.resolve(None, "orchestrator", "orchestrator")
 
+    def _workers(self) -> list[Any]:
+        """Specialists this orchestrator may plan with: the team's members, else every enabled worker."""
+        workers = self.runtime.profiles.workers()
+        topic = self.runtime.topics.get(self.topic_id)
+        team = self.runtime.teams.get(topic.team) if topic is not None and topic.team else None
+        if team is not None and team.members:
+            members = [w for w in workers if w.key in team.members]
+            return members or workers
+        return workers
+
     def _model(self) -> str | None:
         """mission model > profile model > ORCHESTRATOR_MODEL > DEFAULT_MODEL"""
         return self.model or self._prof().model or self.runtime.settings.orchestrator_model
@@ -219,7 +232,11 @@ class Orchestrator(Agent):
         elif strategy == "delegate":  # captains inherit their orchestrator's profile
             cls, kwargs = Orchestrator, {"name_hint": "Captain", "profile": self.profile_key}
         else:
-            specialty = self.runtime.profiles.resolve(str(st.get("specialty", "")).lower(), "worker", "researcher").key
+            wanted = str(st.get("specialty", "")).lower()
+            allowed = [w.key for w in self._workers()]
+            if allowed and wanted not in allowed:  # team missions only use their members
+                wanted = allowed[0]
+            specialty = self.runtime.profiles.resolve(wanted, "worker", allowed[0] if allowed else "researcher").key
             cls, kwargs = Worker, {"specialty": specialty}
         # prefer an idle veteran (own team first, then this region) over a fresh recruit
         rt = self.runtime
@@ -251,14 +268,16 @@ class Orchestrator(Agent):
                        + "\n".join(f"- {a.name}: {spec} / {strat} – earlier: {short(t, 80)}"
                                    for a, (t, spec, strat) in ((a, self._team_entry(a)) for a in team)))
         raw = await self.think(
-            plan_system_prompt(self._prof(), rt.profiles.workers(), s.max_subtasks, allow_delegate, allow_swarm, allies),
+            plan_system_prompt(self._prof(), self._workers(), s.max_subtasks, allow_delegate, allow_swarm, allies),
             prompt,
             activity="Revising battle plan" if followup else "Drafting battle plan",
             temperature=0.2,
             model=self._model(),
             mock=mock.mock_plan_from_team([self._team_entry(a) for a in team][:s.max_subtasks])
             if followup and team else mock.mock_plan(s.max_subtasks, allow_swarm=allow_swarm,
-                                                     allow_delegate=allow_delegate and self.depth == 1),
+                                                     allow_delegate=allow_delegate and self.depth == 1,
+                                                     code=any(r.write for r in getattr(
+                                                         rt.intel.get(self.topic_id), "repos", []))),
         )
         plan = parse_plan(raw, s.max_subtasks) or [
             {"title": "Execute mission", "instructions": text, "specialty": "researcher", "strategy": "single"}]
@@ -317,8 +336,10 @@ class Commander(Agent):
         card.default_input_modes = ["text/plain", "text/markdown", "application/json"]
         return card
 
-    async def survey(self, topic: Any, region_hint: str | None = None) -> Region:
-        """Decide which topic region (area of the map) a new mission belongs to – or chart a new one."""
+    async def survey(self, topic: Any, region_hint: str | None = None,
+                     recall: list[dict[str, Any]] | None = None) -> Region:
+        """Decide which topic region (area of the map) a new mission belongs to – or chart a new one.
+        ``recall`` = related past missions (semantic search) – a strong hint for the right region."""
         rt = self.runtime
         hinted = rt.regions.get(region_hint or "")
         if hinted is not None and hinted.kind == "domain":
@@ -328,9 +349,13 @@ class Commander(Agent):
                   "missions": [t.title for t in rt.region_missions(r.id)][-5:]} for r in domains]
         intel = rt.intel.get(topic.id)
         attached = ", ".join(str(e.get("name")) for e in (intel.summary if intel else [])[:12])
+        related = [f"- {h.get('filename')} (region: {(h['store'].metadata or {}).get('region_name') or '?'}, "
+                   f"score {h.get('score')})" for h in (recall or [])]
         raw = await self.think(
             survey_system(infos), f"Mission title: {topic.title}\nMission:\n{short(topic.goal, 2000)}"
-            + (f"\nAttached context: {attached}" if attached else ""),
+            + (f"\nAttached context: {attached}" if attached else "")
+            + ("\nRelated past missions (semantic search of the mission archive – prefer their region if the "
+               "mission continues that work):\n" + "\n".join(related) if related else ""),
             activity=f"Surveying the landscape for '{short(topic.title, 32)}'", temperature=0.2, use_tools=False,
             model=rt.settings.orchestrator_model, mock=mock_survey(topic.title, topic.goal, infos))
         decision = parse_survey(raw)
@@ -360,9 +385,45 @@ class Commander(Agent):
             return rt.recruit(veteran, parent=self, topic_id=topic.id, model=model)
         return rt.spawn(cls, topic_id=topic.id, parent=self, depth=1, mode=topic.mode, model=model, profile=profile)
 
+    async def propose(self, text: str, md: dict[str, Any]) -> str:
+        """Operations report → topic + region check → pre-filled mission proposal (never starts it)."""
+        rt = self.runtime
+        msgs = [InboxMessage.from_dict(m) for m in md.get("ops_messages") or [] if isinstance(m, dict)]
+        if not msgs:
+            raise RuntimeError("Operations report without messages")
+        triage = md.get("triage") or {}
+        regions = [{"id": r.id, "name": r.name, "biome": r.biome, "description": r.description}
+                   for r in rt.domain_regions()]
+        recent = sorted((t for t in rt.topics.values() if t.kind == "mission"), key=lambda t: -t.created_at)[:15]
+        missions = [{"id": t.id, "title": t.title, "status": t.status,
+                     "region": rt.regions[t.region_id].name if t.region_id in rt.regions else "?"} for t in recent]
+        self.set_status("delegating", "Reviewing an operations report")
+        raw = await self.think(
+            proposal_system(regions, missions), f"Intel note from the Communication Orchestrator:\n{text}\n\n"
+            + "\n\n---\n\n".join(m.digest() for m in msgs),
+            activity=f"Drafting a proposal: {short(msgs[0].subject or msgs[0].body, 32)}", temperature=0.2,
+            use_tools=False, model=rt.settings.orchestrator_model, mock=mock_proposal(msgs, triage, regions))
+        d = parse_proposal(raw, msgs, triage)
+        follow = rt.topics.get(d["followup_topic_id"] or "")
+        follow_ok = follow is not None and follow.kind == "mission" and follow.root_agent_id is not None
+        region_id = d["region_id"] if d["region_id"] in rt.regions and rt.regions[d["region_id"]].kind == "domain" \
+            else None
+        if follow_ok:
+            region_id = follow.region_id
+        p = rt.ops.add_proposal(
+            title=d["title"], goal=d["goal"], mode=d["mode"], priority=d["priority"], rationale=d["rationale"],
+            note=str(md.get("ops_note") or text)[:4000], kind="followup" if follow_ok else "mission",
+            followup_topic_id=follow.id if follow_ok else None, region_id=region_id,
+            new_region=None if region_id else d["new_region"],
+            channels=sorted({m.channel for m in msgs}), messages=[m.to_dict() for m in msgs])
+        return (f"Proposal {p.id} '{p.title}' ({'feedback round' if follow_ok else 'new mission'}) is waiting for "
+                "human approval.")
+
     async def run(self, text: str, ctx: TaskContext) -> str:
         md = ctx.metadata
         rt = self.runtime
+        if md.get("intent") == "ops_report":  # from the operations team: propose, don't start
+            return await self.propose(text, md)
         # A2A semantics: a message in an existing mission's contextId is feedback for that mission
         topic = rt.topics.get(str(md.get("topic_id") or "")) or rt.topics.get(ctx.task.context_id)
         if topic is not None and topic.kind != "mission":
@@ -378,7 +439,7 @@ class Commander(Agent):
         self.active_missions += 1
         self.set_status("delegating", f"Commanding {self.active_missions} mission(s)")
         try:
-            items = items_from_message(ctx.message)
+            items = await asyncio.to_thread(items_from_message, ctx.message)  # PDFs/Office are converted here
             if items:  # files (FilePart) + references (DataPart) attached to the A2A message
                 self.set_status("delegating", f"Gathering intel ({len(items)} item{'s' if len(items) > 1 else ''})")
                 await rt.attach_intel(topic, items)
@@ -389,17 +450,21 @@ class Commander(Agent):
                           f"Your previous deliverable:\n{short(topic.result or '(none)', 4000)}\n\n"
                           "Revise and improve the deliverable so that it fully addresses the feedback.")
             else:
+                recall = await rt.recall_past_missions(topic)  # all region archives, before routing
                 if topic.center is None:
                     async with self._survey_lock:
-                        rt.place_topic(topic, await self.survey(topic, md.get("region_id")))
+                        rt.place_topic(topic, await self.survey(topic, md.get("region_id"), recall))
                 await rt.link_region_knowledge(topic)
-                prompt = text
+                rt.link_recalled_knowledge(topic, recall)
+                briefing = recall_briefing(recall)
+                prompt = f"{text}\n\n{briefing}" if briefing else text
             root = self._root_for(topic, md.get("model") or None, followup, md.get("profile") or None)
             topic.root_agent_id = root.id
             rt.topic_changed(topic)
             result = await self.delegate(root, prompt, metadata={
                 "topic_id": topic.id, "mode": topic.mode, "swarm_size": md.get("swarm_size"),
                 "subtask": topic.title, "followup": followup})
+            await rt.finalize_repos(topic)  # commit leftovers on mission branches
             rt.finish_topic(topic, "completed", result)
             rt.schedule_archive(topic)
             return result

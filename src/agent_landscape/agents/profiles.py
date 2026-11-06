@@ -5,7 +5,7 @@ A profile is a Markdown file with YAML frontmatter (same idea as Claude Code sub
 
     ---
     key: researcher            # unique id (file name without .md)
-    kind: worker               # worker | orchestrator | swarm_leader | swarm_member
+    kind: worker               # worker | orchestrator | swarm_leader | swarm_member | ops_lead | monitor
     title: Scout
     icon: 🔭
     description: Gathers facts, options and prior art.   # shown to orchestrators when they plan
@@ -43,7 +43,7 @@ from ..frontmatter import parse_frontmatter
 log = logging.getLogger(__name__)
 
 BUILTIN_DIR = Path(__file__).parent / "profiles"
-KINDS = ("worker", "orchestrator", "swarm_leader", "swarm_member")
+KINDS = ("worker", "orchestrator", "swarm_leader", "swarm_member", "ops_lead", "monitor")
 TOOL_FAMILIES: dict[str, str] = {
     "intel": "Read documents attached to the mission (read_intel)",
     "files": "Read attached folders (list_dir, read_file, search_files)",
@@ -51,13 +51,21 @@ TOOL_FAMILIES: dict[str, str] = {
     "knowledge_admin": "Create, link and fill knowledge bases (kb_catalog, kb_link, kb_create, kb_add, kb_ingest)",
     "mcp": "MCP tools attached to the mission",
     "skills": "Load skills from the repo (use_skill, read_skill_file)",
+    "repo": "Inspect attached git repos – history, mission diff (repo_info, repo_log, repo_diff)",
+    "repo_write": "✍️ Change files in editable repos and commit to the mission branch "
+                  "(edit_file, write_file, delete_file, repo_commit) – never pushes",
+    "checks": "🧪 Run allow-listed checks in a mission repo: tests, coverage, lint, dead_code (run_check) – "
+              "executes repo code in the worktree, no shell",
 }
 ALL_FAMILIES = tuple(TOOL_FAMILIES)
 DEFAULT_TOOLS: dict[str, list[str]] = {
-    "worker": ["intel", "files", "knowledge", "mcp", "skills"],
-    "swarm_member": ["intel", "files", "knowledge", "mcp", "skills"],
-    "orchestrator": list(ALL_FAMILIES),
+    "worker": ["intel", "files", "knowledge", "mcp", "skills", "repo"],
+    "swarm_member": ["intel", "files", "knowledge", "mcp", "skills", "repo"],
+    "orchestrator": [f for f in ALL_FAMILIES if f not in ("repo_write", "checks")],
     "swarm_leader": [],
+    # operations team: read-only by design – no tools at all (they only see the messages they triage)
+    "ops_lead": [],
+    "monitor": [],
 }
 KEY_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
 
@@ -92,6 +100,7 @@ class Profile:
     prompt: str = ""
     model: str | None = None
     temperature: float | None = None
+    max_tool_steps: int | None = None  # tool-call rounds per answer; None = MAX_TOOL_STEPS
     tools: list[str] = field(default_factory=list)
     grant_mcp: list[str] = field(default_factory=list)
     skills: list[str] = field(default_factory=lambda: ["*"])
@@ -104,7 +113,7 @@ class Profile:
     def rev(self) -> str:
         """Short content hash – shows in reports which version of the instructions an agent used."""
         payload = repr((self.prompt, self.prompts, self.model, self.temperature, self.tools, self.grant_mcp,
-                        self.skills))
+                        self.skills) + ((self.max_tool_steps,) if self.max_tool_steps else ()))
         return hashlib.sha1(payload.encode()).hexdigest()[:7]
 
     def allows_skill(self, name: str) -> bool:
@@ -116,7 +125,7 @@ class Profile:
     def to_markdown(self) -> str:
         meta: dict[str, Any] = {"key": self.key, "kind": self.kind, "title": self.title, "icon": self.icon,
                                 "description": self.description}
-        for k in ("model", "temperature"):
+        for k in ("model", "temperature", "max_tool_steps"):
             if getattr(self, k) is not None:
                 meta[k] = getattr(self, k)
         meta["tools"] = self.tools
@@ -146,10 +155,12 @@ class Profile:
         if not isinstance(prompts, dict):
             raise ValueError("prompts must be a mapping, e.g. {plan: ..., synthesize: ...}")
         temp = meta.get("temperature")
+        steps = meta.get("max_tool_steps")
+        steps = max(1, min(int(steps), 40)) if steps not in (None, "") else None
         return cls(key=key, kind=kind, title=str(meta.get("title") or key.replace("-", " ").title())[:40],
                    icon=str(meta.get("icon") or "🤖")[:4], description=" ".join(str(meta.get("description") or "").split())[:400],
                    prompt=body.strip(), model=(str(meta["model"]).strip() or None) if meta.get("model") else None,
-                   temperature=float(temp) if temp not in (None, "") else None, tools=tools,
+                   temperature=float(temp) if temp not in (None, "") else None, max_tool_steps=steps, tools=tools,
                    grant_mcp=_list(meta.get("grant_mcp")), skills=_list(meta.get("skills")) if "skills" in meta else ["*"],
                    prompts={str(k): str(v).strip() for k, v in prompts.items() if v},
                    enabled=bool(meta.get("enabled", True)), source=source, path=path)

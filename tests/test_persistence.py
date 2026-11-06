@@ -98,6 +98,41 @@ async def test_state_survives_restart(tmp_path):
             assert state["config"]["persistence"]["enabled"] and state["config"]["persistence"]["restored"]["missions"] == 1
 
 
+async def test_pinned_agent_model_wins_and_survives_restart(tmp_path):
+    db = tmp_path / "landscape.db"
+    with running(db) as (app, base):
+        rt = app.state.runtime
+        async with httpx.AsyncClient(timeout=60) as http:
+            client = A2AClient(rt.commander.url, http)
+            res = await client.send(Message.of("Plan the rollout", metadata={"title": "Rollout", "mode": "hierarchy"}))
+            root_id = rt.topics[res.context_id].root_agent_id
+            r = await http.patch(f"{base}/api/agents/{root_id}", json={"pinned_model": "pinned-model-x"})
+            assert r.status_code == 200 and r.json()["model_source"] == "pinned"
+            assert r.json()["model"] == "pinned-model-x" and r.json()["pinned_model"] == "pinned-model-x"
+            assert (await http.patch(f"{base}/api/agents/nope", json={})).status_code == 404
+            # the next LLM turns of the pinned unit use the pinned model, even in a feedback round
+            used: list[tuple[str, str]] = []
+            orig = rt.llm.complete
+
+            async def spy(messages, **kw):
+                used.append(((kw.get("metadata") or {}).get("agent_id"), kw.get("model")))
+                return await orig(messages, **kw)
+
+            rt.llm.complete = spy
+            await client.send(Message.of("Add a timeline", context_id=res.context_id))
+            rt.llm.complete = orig
+            root_models = {m for a, m in used if a == root_id}
+            assert root_models == {"pinned-model-x"}, used
+            assert any(a != root_id and m != "pinned-model-x" for a, m in used)  # only this unit is pinned
+
+    with running(db) as (app, base):
+        rt = app.state.runtime
+        assert rt.agents[root_id].pinned_model == "pinned-model-x"
+        async with httpx.AsyncClient(timeout=60) as http:
+            r = await http.patch(f"{base}/api/agents/{root_id}", json={"pinned_model": None})
+            assert r.json()["pinned_model"] is None and r.json()["model_source"] != "pinned"
+
+
 async def test_running_mission_is_interrupted_and_resumable(tmp_path):
     db = tmp_path / "landscape.db"
     with running(db, mock_delay=(0.6, 0.8)) as (app, base):

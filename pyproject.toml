@@ -12,10 +12,13 @@ dependencies = [
     "litellm>=1.60",
     "mcp>=1.10",  # litellm imports its MCP bridge for every request that carries tools
     "python-dotenv>=1.0",
+    "markitdown[pdf,docx,pptx,xlsx]>=0.1",  # PDF / Office attachments → markdown for agents
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+# tools behind the agents' sandboxed `run_check` (coverage / lint / dead_code checks)
+checks = ["pytest-cov>=5", "ruff>=0.6", "vulture>=2.11"]
 
 [project.scripts]
 agent-landscape = "agent_landscape.__main__:main"
@@ -26,6 +29,14 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_landscape"]
+
+[tool.ruff]
+line-length = 120
+extend-exclude = ["workspace", "data"]
+
+[tool.ruff.lint]
+# real problems only (unused / undefined names, likely bugs) – also what the agents' `lint` check reports
+select = ["F", "B", "E9"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
