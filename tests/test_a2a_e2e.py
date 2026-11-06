@@ -344,6 +344,12 @@ async def test_knowledge_bases_end_to_end(server):
             "title": "Sensor alerting", "mode": "hierarchy", "region_id": region.id}))
         t2 = rt.topics[res2.context_id]
         assert any(k["name"] == archive_name and k["how"] == "region" for k in t2.knowledge)
+        # the archive holds the full mission report, and Command HQ recalled it for the follow-up mission
+        store = next(s for s in await rt.vectors.stores(refresh=True) if s.name == archive_name)
+        assert any("# Mission Report: Sensor platform" in text for _, text in rt.vectors.backend.docs[store.id])
+        report2 = (await http.get(f"{base}/api/topics/{t2.id}/report")).json()
+        root_input = report2["rounds"][0]["artifacts"][0]["input"]
+        assert "Recall: related past missions" in root_input and archive_name in root_input
 
         kb = (await http.get(f"{base}/api/knowledge")).json()
         assert kb["enabled"] and kb["kind"] == "memory"

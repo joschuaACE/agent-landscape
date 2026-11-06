@@ -5,8 +5,10 @@ Thin client for the vector store REST API at ``VECTOR_STORE_URL`` plus the polic
 * naming   – ``al-<region>-<purpose>`` (unique, descriptive), provenance in store metadata
 * scoping  – stores are *linked* to a mission; sub-agents can only search linked stores
 * writing  – only stores created by Agent Landscape (metadata.owner) can be written to
-* archive  – completed missions are archived into the region's knowledge store
+* archive  – completed missions (full mission report) are archived into the region's knowledge store
              (``al-<region>-knowledge``) so later missions in the same area can build on them
+* recall   – before routing a new mission, Command HQ searches *all* region knowledge stores for
+             related past missions (``recall``) and briefs the orchestrator with the best hits
 
 In mock mode an in-memory backend is used, so demos and tests never touch the real service.
 """
@@ -27,6 +29,44 @@ log = logging.getLogger(__name__)
 
 OWNER = "agent-landscape"
 MAX_NAME = 63
+MAX_ARCHIVE_CHARS = 300_000  # cap for one archived mission report
+
+_REPORT_TITLE = re.compile(r"^#\s*Mission(?: Report)?:\s*(.+?)\s*$", re.M)
+_REPORT_REGION = re.compile(r"^-\s*\*\*Region:\*\*\s*(.+?)\s*$", re.M)
+
+
+def parse_report(text: str) -> tuple[str | None, str | None]:
+    """(title, region name) of an exported mission report (``# Mission Report: …`` / ``- **Region:** 🏜️ X (Desert)``)."""
+    m = _REPORT_TITLE.search(text or "")
+    title = m.group(1) if m else None
+    m = _REPORT_REGION.search(text or "")
+    if not m:
+        return title, None
+    raw = re.sub(r"\s*\([^)]*\)\s*$", "", m.group(1)).strip()  # drop "(Biome label)"
+    parts = raw.split(None, 1)
+    if parts and not re.match(r"\w", parts[0]):  # drop the leading region icon
+        raw = parts[1] if len(parts) > 1 else ""
+    raw = raw.strip()
+    return title, (raw if raw and raw not in ("–", "-") else None)
+
+
+def recall_briefing(hits: list[dict[str, Any]], snippet_chars: int = 600) -> str:
+    """Markdown section for the orchestrator's order: related past missions found by ``VectorService.recall``."""
+    if not hits:
+        return ""
+    lines = ["## Recall: related past missions",
+             "Command HQ searched the mission archive (region knowledge bases) for similar earlier work. Build on it "
+             "where it applies – don't redo solved parts, and verify anything that may be outdated. The source "
+             "knowledge bases are linked to this mission – use `kb_search` on them for details.", ""]
+    for h in hits:
+        s: StoreInfo = h["store"]
+        region = (s.metadata or {}).get("region_name")
+        snippet = " ".join(str(h.get("text") or "").split())
+        if len(snippet) > snippet_chars:
+            snippet = snippet[:snippet_chars].rstrip() + " …"
+        lines.append(f"- **{h.get('filename') or 'document'}** in `{s.name}`"
+                     + (f" (region {region}" if region else " (") + f", score {h.get('score')}): {snippet}")
+    return "\n".join(lines)
 
 
 def slug(text: str, max_len: int = 40) -> str:
@@ -269,20 +309,64 @@ class VectorService:
         return await self.create(f"{region.name} knowledge", f"Shared knowledge and mission archive of the "
                                  f"'{region.name}' topic region.", region=region, kind="region-knowledge")
 
-    async def archive(self, topic: Any, region: Any) -> StoreInfo | None:
-        """Store a completed mission's deliverable in the region knowledge base."""
+    async def archive(self, topic: Any, region: Any, report: str | None = None) -> StoreInfo | None:
+        """Store a completed mission in the region knowledge base – the full mission report when given
+        (objective, intel, every agent's input/output, tool calls), else objective + deliverable."""
         if not self.backend or not self.auto_archive or not topic.result or region is None:
             return None
         store = await self.region_store(region, create=True)
         if store is None:
             return None
-        doc = (f"# Mission: {topic.title}\n\n- Region: {region.name}\n- Round: {topic.rounds}\n"
-               f"- Date: {time.strftime('%Y-%m-%d %H:%M')}\n\n## Objective\n\n{topic.goal}\n\n"
-               + ("## Feedback rounds\n\n" + "\n".join(f"- {f}" for f in topic.feedback) + "\n\n" if topic.feedback else "")
-               + f"## Deliverable\n\n{topic.result}\n")
+        stamp = f"- Region: {region.name}\n- Round: {topic.rounds}\n- Archived: {time.strftime('%Y-%m-%d %H:%M')}\n"
+        if report:
+            if len(report) > MAX_ARCHIVE_CHARS:
+                report = report[:MAX_ARCHIVE_CHARS] + "\n\n… (report truncated)\n"
+            doc = f"{report.rstrip()}\n\n---\n\n{stamp}"
+        else:
+            doc = (f"# Mission: {topic.title}\n\n{stamp}\n## Objective\n\n{topic.goal}\n\n"
+                   + ("## Feedback rounds\n\n" + "\n".join(f"- {f}" for f in topic.feedback) + "\n\n"
+                      if topic.feedback else "")
+                   + f"## Deliverable\n\n{topic.result}\n")
         await self.backend.add_documents(store.id, [(f"mission-{slug(topic.title, 40)}-r{topic.rounds}.md", doc)])
         self._cache = None
         return store
+
+    async def region_stores(self, refresh: bool = False) -> list[StoreInfo]:
+        """All non-empty region knowledge stores (the mission archive of every region)."""
+        return [s for s in await self.stores(refresh=refresh)
+                if (s.metadata or {}).get("kind") == "region-knowledge" and s.files]
+
+    async def recall(self, query: str, *, limit: int = 5, per_store: int = 3, min_score: float = 0.0,
+                     timeout: float = 20.0) -> list[dict[str, Any]]:
+        """Search every region archive for past missions related to ``query``; best hit per document,
+        each hit carries its ``store``."""
+        if not self.backend or limit <= 0 or not query.strip():
+            return []
+        stores = await self.region_stores()
+        if not stores:
+            return []
+        backend = self.backend
+
+        async def one(s: StoreInfo) -> list[dict[str, Any]]:
+            try:
+                return [{**h, "store": s} for h in await backend.search(s.id, query[:2000], per_store)]
+            except Exception as exc:  # noqa: BLE001 – one broken store must not block the recall
+                log.warning("Recall in %s failed: %s", s.name, exc)
+                return []
+
+        results = await asyncio.wait_for(asyncio.gather(*(one(s) for s in stores)), timeout)
+        hits = sorted((h for r in results for h in r if float(h.get("score") or 0) >= min_score),
+                      key=lambda h: -float(h.get("score") or 0))
+        out: list[dict[str, Any]] = []
+        seen: set[tuple[str, Any]] = set()
+        for h in hits:
+            key = (h["store"].id, h.get("filename"))
+            if key not in seen:
+                seen.add(key)
+                out.append(h)
+            if len(out) >= limit:
+                break
+        return out
 
     async def add(self, store: StoreInfo, docs: list[tuple[str, str]]) -> None:
         assert self.backend is not None

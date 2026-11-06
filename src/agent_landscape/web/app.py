@@ -8,7 +8,7 @@ import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -16,6 +16,8 @@ from pydantic import BaseModel, Field
 from ..a2a.server import create_a2a_router
 from ..agents.profiles import KINDS, TOOL_FAMILIES
 from ..config import Settings
+from ..context import documents
+from ..context import repos as gitrepo
 from ..context import sandbox
 from ..context.intel import ContextItem
 from ..runtime.reports import build_report, report_markdown
@@ -33,6 +35,29 @@ class MissionRequest(BaseModel):
     region_id: str | None = None  # None → the Command HQ decides the region
     profile: str | None = None  # orchestrator / hive-leader profile for the mission's root agent
     context: list[ContextItem] = Field(default_factory=list, max_length=50)
+    proposal_id: str | None = None  # approved operations proposal this mission comes from
+    new_region: dict[str, str] | None = None  # chart this region first (proposal suggested a new one)
+
+
+class TeamRunRequest(BaseModel):
+    prompt: str | None = Field(default=None, max_length=8000)
+
+
+class TeamPauseRequest(BaseModel):
+    paused: bool
+
+
+class TeamImplementRequest(BaseModel):
+    findings: str = Field(min_length=1, max_length=400)  # e.g. "F1, F3"
+    notes: str | None = Field(default=None, max_length=4000)
+
+
+class SimulateRequest(BaseModel):
+    channel: str = "outlook"
+    relevant: bool | None = None  # None = random pool message
+    sender: str | None = Field(default=None, max_length=200)
+    subject: str | None = Field(default=None, max_length=300)
+    body: str | None = Field(default=None, max_length=8000)
 
 
 class ProfileIn(BaseModel):
@@ -44,11 +69,29 @@ class ProfileIn(BaseModel):
     prompt: str = Field(min_length=1, max_length=20000)
     model: str | None = None
     temperature: float | None = Field(default=None, ge=0, le=2)
+    max_tool_steps: int | None = Field(default=None, ge=1, le=40)
     tools: list[str] = Field(default_factory=list)
     grant_mcp: list[str] = Field(default_factory=list)
     skills: list[str] = Field(default_factory=lambda: ["*"])
     prompts: dict[str, str] = Field(default_factory=dict)
     enabled: bool = True
+
+
+class AgentPatch(BaseModel):
+    pinned_model: str | None = Field(default=None, max_length=200)  # None / "" = unpin
+
+
+class ConfigPatch(BaseModel):
+    default_model: str = Field(min_length=1, max_length=200)  # runtime only – .env stays untouched
+
+
+class RepoIn(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    url: str | None = Field(default=None, max_length=500)
+    path: str | None = Field(default=None, max_length=1000)
+    branch: str | None = Field(default=None, max_length=200)
+    description: str = Field(default="", max_length=400)
+    keywords: list[str] = Field(default_factory=list, max_length=20)
 
 
 class FeedbackRequest(BaseModel):
@@ -103,13 +146,114 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def models():
         return {"models": await runtime.llm.list_models(), "default": settings.default_model}
 
+    @app.patch("/api/config")
+    async def patch_config(req: ConfigPatch):
+        """Switch DEFAULT_MODEL until the next restart (HUD model chip)."""
+        model = req.default_model.strip()
+        if not settings.mock:
+            known = await runtime.llm.list_models()
+            if known and model not in known:
+                raise HTTPException(400, f"Unknown model '{model}' – pick one from /api/models")
+        settings.default_model = model
+        runtime.model_problems = await runtime.llm.check_models()
+        config = runtime.snapshot()["config"]
+        runtime.emit("config_changed", config=config)
+        runtime.log(f"🎛️ Default model switched to {model} (until restart)")
+        return config
+
     @app.post("/api/missions")
     async def create_mission(req: MissionRequest):
         _check_context_size(req.context)
         topic = await runtime.start_mission(req.goal, title=req.title, mode=req.mode,
                                             swarm_size=req.swarm_size, model=req.model or None,
                                             region_id=req.region_id or None, context=req.context,
-                                            profile=req.profile or None)
+                                            profile=req.profile or None, new_region=req.new_region or None,
+                                            proposal_id=req.proposal_id or None)
+        return topic.to_dict()
+
+    # ------------------------------------------------------------ teams
+    @app.get("/api/teams")
+    async def teams_state():
+        return runtime.teams.snapshot()
+
+    @app.post("/api/teams/{key}/run")
+    async def team_run(key: str, req: TeamRunRequest):
+        try:
+            topic = await runtime.teams.run(key, prompt=req.prompt)
+        except KeyError:
+            raise HTTPException(404, "Unknown team") from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return topic.to_dict()
+
+    @app.post("/api/teams/{key}/pause")
+    async def team_pause(key: str, req: TeamPauseRequest):
+        try:
+            runtime.teams.set_paused(key, req.paused)
+        except KeyError:
+            raise HTTPException(404, "Unknown team") from None
+        return {"ok": True, "paused": req.paused}
+
+    @app.post("/api/teams/{key}/runs/{topic_id}/implement")
+    async def team_implement(key: str, topic_id: str, req: TeamImplementRequest):
+        """Approve findings of a team run: feedback round on the same mission, repos upgraded to editable."""
+        team = runtime.teams.get(key)
+        topic = runtime.topics.get(topic_id)
+        if team is None or topic is None or topic.team != key:
+            raise HTTPException(404, "Unknown team run")
+        text = (f"Approved by the human – implement these findings now: {req.findings.strip()}.\n"
+                "Give each approved finding to the integrator (✍️ 🧪) as its own work item with the exact files, "
+                "the change and the test to run. Skip everything that was not approved. Report per finding: "
+                "done / skipped, commit and test result."
+                + (f"\n\nNotes from the human: {req.notes.strip()}" if req.notes and req.notes.strip() else ""))
+        items = [ContextItem(kind="repo", repo=r["repo"], write=True, ref=r.get("ref")) for r in team.repos]
+        res = await runtime.send_followup(topic_id, text, context=items)
+        if res is None:
+            raise HTTPException(409, "The run is still active – wait until it has finished")
+        runtime.log(f"✅ You approved findings {req.findings.strip()} for '{topic.title}'", topic_id=topic_id,
+                    level="success")
+        return res.to_dict()
+
+    # ------------------------------------------------- operations team
+    @app.get("/api/ops")
+    async def ops_state():
+        return runtime.ops.snapshot()
+
+    @app.post("/api/ops/refresh")
+    async def ops_refresh():
+        """Manual refresh: check Outlook / Teams sources now instead of waiting for the next poll."""
+        try:
+            return {"channels": await runtime.ops.poll_now()}
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/ops/simulate")
+    async def ops_simulate(req: SimulateRequest):
+        """Mock source: a message arrives in Outlook / Teams right now (the monitor picks it up)."""
+        try:
+            return await runtime.ops.simulate(req.channel, relevant=req.relevant, sender=req.sender,
+                                              subject=req.subject, body=req.body)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/ops/proposals/{proposal_id}/dismiss")
+    async def ops_dismiss(proposal_id: str):
+        p = runtime.ops.dismiss(proposal_id)
+        if p is None:
+            raise HTTPException(409, "Only pending proposals can be dismissed")
+        return p.to_dict()
+
+    @app.post("/api/ops/proposals/{proposal_id}/feedback")
+    async def ops_approve_feedback(proposal_id: str, req: FeedbackRequest):
+        """Approve a 'feedback round' proposal: the existing mission team re-works its deliverable."""
+        p = runtime.ops.proposals.get(proposal_id)
+        if p is None or p.status != "pending" or not p.followup_topic_id:
+            raise HTTPException(409, "Not a pending feedback proposal")
+        _check_context_size(req.context)
+        topic = await runtime.send_followup(p.followup_topic_id, req.text, context=req.context)
+        if topic is None:
+            raise HTTPException(409, "The mission is still running or can't take feedback right now")
+        runtime.ops.approved(p.id, topic.id)
         return topic.to_dict()
 
     # ------------------------------------------------------- profiles
@@ -159,6 +303,97 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404, "Unknown skill")
         return {**skill.brief(), "instructions": skill.instructions()}
 
+    # ---------------------------------------------------------- repos
+    @app.get("/api/repos")
+    async def list_repos():
+        reg = runtime.repos
+        reg.refresh()
+        specs = sorted(reg.repos.values(), key=lambda s: s.name)
+        rows = await asyncio.gather(*(reg.status(s) for s in specs), return_exceptions=True)
+        out = [r if isinstance(r, dict) else {**s.to_dict(), "error": str(r)} for s, r in zip(specs, rows)]
+        return {"repos": out, "file": str(reg.file) if reg.file else None, "editable": reg.file is not None,
+                "workspace": str(reg.workspace), "errors": reg.errors}
+
+    @app.put("/api/repos/{name}")
+    async def save_repo(name: str, req: RepoIn):
+        if req.name.strip().lower() != name.lower():
+            raise HTTPException(400, "Name in the URL and body differ")
+        try:
+            spec = await runtime.repos.save(req.model_dump())
+        except (ValueError, PermissionError) as exc:  # RepoError / SandboxError are ValueErrors
+            raise HTTPException(400, str(exc)) from exc
+        runtime.log(f"📦 Repo '{spec.name}' registered ({spec.path or spec.url})", level="success")
+        warning = None
+        try:  # clone / fetch right away: validates URL + credentials and makes the first mission fast
+            _, warning = await runtime.repos.ensure_checkout(spec)
+        except ValueError as exc:
+            warning = str(exc)
+        return {**await runtime.repos.status(spec), "warning": warning}
+
+    @app.delete("/api/repos/{name}")
+    async def delete_repo(name: str):
+        if not runtime.repos.remove(name):
+            raise HTTPException(404, "Unknown repo")
+        return {"ok": True}  # clones in the workspace are kept (cheap re-registration)
+
+    @app.post("/api/repos/{name}/sync")
+    async def sync_repo(name: str):
+        spec = runtime.repos.get(name)
+        if spec is None:
+            raise HTTPException(404, "Unknown repo")
+        try:
+            _, warning = await runtime.repos.ensure_checkout(spec)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {**await runtime.repos.status(spec), "warning": warning}
+
+    def _mission_repo(topic_id: str, name: str):
+        intel = runtime.intel.get(topic_id)
+        mr = intel.repo(name) if intel else None
+        if mr is None:
+            raise HTTPException(404, "Repo is not attached to this mission")
+        return mr
+
+    @app.get("/api/topics/{topic_id}/repos")
+    async def topic_repos(topic_id: str):
+        """Code changes of a mission: per repo branch, commits, diff (for review before pushing)."""
+        intel = runtime.intel.get(topic_id)
+        out = []
+        for mr in (intel.repos if intel else []):
+            entry = {**mr.to_dict(), "exists": Path(mr.path).exists()}
+            if entry["exists"]:
+                try:
+                    await gitrepo.refresh_changes(mr)
+                    entry["changed"] = mr.changed
+                    entry["stat"] = await gitrepo.diff(mr, stat=True)
+                    entry["diff"] = await gitrepo.diff(mr)
+                except ValueError as exc:
+                    entry["error"] = str(exc)
+            out.append(entry)
+        return {"repos": out}
+
+    @app.post("/api/topics/{topic_id}/repos/{name}/push")
+    async def push_repo(topic_id: str, name: str):
+        """Human approval step: push the mission branch to origin (agents never push)."""
+        mr = _mission_repo(topic_id, name)
+        try:
+            out = await gitrepo.push(mr)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        runtime.log(f"📦 Pushed {mr.branch} of {mr.name} to origin", topic_id=topic_id, level="success")
+        runtime.repo_changed(topic_id, mr, by="you")
+        return {"ok": True, "output": out, "pushed": mr.pushed}
+
+    @app.post("/api/context/convert")
+    async def convert_document(request: Request, name: str):
+        """PDF / Word / PowerPoint / Excel (raw request body) → markdown text for the briefing (local, offline)."""
+        data = await request.body()
+        try:
+            text, kind = await asyncio.to_thread(documents.convert, name, data)
+        except documents.ConversionError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return {"name": name, "kind": kind, "bytes": len(data), "chars": len(text), "text": text}
+
     @app.get("/api/context/inspect")
     async def inspect_path(path: str):
         """Validate a folder/file path for the composer (sandbox rules apply)."""
@@ -188,6 +423,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                for s in stores]
         out.sort(key=lambda s: (not s["owned"], s["name"]))
         return {"enabled": True, "kind": v.kind, "prefix": v.prefix, "stores": out}
+
+    @app.post("/api/knowledge/import-archive")
+    async def import_archive():
+        """(Re-)import exported mission reports from MISSION_ARCHIVE_DIR into the region knowledge bases."""
+        if not runtime.vectors.enabled:
+            raise HTTPException(400, "Knowledge bases are disabled (VECTOR_STORE_URL not set)")
+        if not settings.mission_archive_dir:
+            raise HTTPException(400, "MISSION_ARCHIVE_DIR is off")
+        return await runtime.import_mission_archive()
 
     @app.get("/api/tools")
     async def list_tools(refresh: bool = False):
@@ -271,6 +515,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if agent is None:
             raise HTTPException(404, "Unknown agent")
         return {**agent.to_dict(), "card": agent.card().dump()}
+
+    @app.patch("/api/agents/{agent_id}")
+    async def patch_agent(agent_id: str, req: AgentPatch):
+        agent = runtime.get_agent(agent_id)
+        if agent is None:
+            raise HTTPException(404, "Unknown agent")
+        if agent.role == "ally":
+            raise HTTPException(400, "Allied agents run their own model")
+        model = (req.pinned_model or "").strip() or None
+        if model and not settings.mock:
+            known = await runtime.llm.list_models()
+            if known and model not in known:
+                raise HTTPException(400, f"Unknown model '{model}' – pick one from /api/models")
+        agent.pinned_model = model
+        runtime.agent_changed(agent)
+        runtime.log(f"🎛️ {agent.name}: model {'pinned to ' + model if model else 'unpinned (inherits again)'}",
+                    agent=agent)
+        return agent.to_dict()
 
     @app.post("/api/allies")
     async def add_ally(req: RemoteAgentRequest):

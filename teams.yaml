@@ -1,0 +1,78 @@
+# Teams: lead profile + specialists + repos + standing orders – run from the 👥 Teams tab or on a schedule.
+#
+#   key:        unique id (lowercase-with-dashes)
+#   area:       group in the UI
+#   lead:       orchestrator profile that plans the work (profiles/ or built-in)
+#   members:    worker profiles the lead may assign ([] = all enabled specialists)
+#   repos:      [{repo: <name in repos.yaml>, write: false|true, ref: <branch>}]
+#   goal:       standing orders – placeholders {date} {weekday} {prompt}; empty = the team works on request
+#   schedule:   cron in local time "min hour day month weekday", e.g. "0 12 * * 1-5" = Mon–Fri 12:00
+#   region:     map region its runs are placed in (created on the first run)
+#   mode:       hierarchy | swarm | auto        model: optional model for the whole team
+#
+# The file is reloaded automatically when it changes.
+teams:
+
+# ------------------------------------------------------------------ 4 · Maintaining this platform
+- key: lifecycle-daily
+  area: 4 · Maintaining this platform
+  title: Daily code health check
+  icon: 🔧
+  description: Dead code, redundant tests and coverage gaps in agent-landscape – findings wait for your approval.
+  lead: orchestrator
+  members: [code-janitor, coverage-scout, integrator]
+  repos: [{repo: agent-landscape, write: false}]
+  region: Platform Lifecycle
+  schedule: "0 12 * * 1-5"
+  goal: |
+    Daily code health check of the agent-landscape repo ({weekday}, {date}).
+
+    Run exactly two subtasks in parallel, nothing else:
+    1. "code-janitor": dead code, unused imports and redundant / obsolete tests (run_check dead_code + lint, verify every hit).
+    2. "coverage-scout": coverage gaps – which few new tests are worth writing (run_check coverage).
+    Do NOT give work to "integrator" in this round – the repo is read-only; the human approves findings first.
+
+    Deliverable: one prioritised list of at most 8 findings, numbered F1, F2, … in the
+    agent-landscape-maintenance finding format (kind, where, evidence, action, value, risk, effort, confidence),
+    best value ÷ effort first, then a one-line health summary (test result, total coverage, lint/dead-code counts).
+    If nothing is worth doing, say so – that is a good result.
+
+- key: lifecycle-features
+  area: 4 · Maintaining this platform
+  title: Feature requests
+  icon: 🧭
+  description: Prompt an idea – the Feature Steward shapes it with you over feedback rounds, delegates the build and rates its maturity.
+  lead: feature-steward
+  members: [integrator, researcher, analyst, designer, architect, code-janitor, critic]
+  repos: [{repo: agent-landscape, write: true}]
+  region: Platform Lifecycle
+  prompt_hint: "Describe the feature idea – what should be possible, for whom, and why…"
+  goal: |
+    Feature request for the agent-landscape platform:
+
+    {prompt}
+
+    Follow your phases: round 1 = understand and propose spec + acceptance criteria + questions (build only if the
+    request is tiny and unambiguous). Build in later rounds once the human agrees.
+
+# ------------------------------------------------------------------ 1 · Project acquisition
+- key: customer-research
+  area: 1 · Project acquisition
+  title: Customer research
+  icon: 🔭
+  description: Research a customer, market or tender – facts, needs, opportunities and a pitch angle.
+  lead: orchestrator
+  members: [researcher, analyst, writer]
+  prompt_hint: "Which customer / project? What do you want to know?"
+  goal: ""
+
+# ------------------------------------------------------------------ 2 · Architects
+- key: design-principles
+  area: 2 · Architects
+  title: Design principles & patterns
+  icon: 🏛️
+  description: Research design principles, AI and software patterns for a question and document the decision as an ADR.
+  lead: orchestrator
+  members: [researcher, architect, critic]
+  prompt_hint: "Which architecture question or pattern?"
+  goal: ""

@@ -17,10 +17,14 @@ _SUBTASKS = [
 ]
 
 
-def mock_plan(max_subtasks: int, *, allow_swarm: bool, allow_delegate: bool) -> str:
+def mock_plan(max_subtasks: int, *, allow_swarm: bool, allow_delegate: bool, code: bool = False) -> str:
     n = random.randint(2, max(2, max_subtasks))
     picks = random.sample(_SUBTASKS, n)
     subtasks = []
+    if code:  # an editable repo is attached → like a real planner, give the change to an engineer
+        picks = picks[:max(1, max_subtasks - 1)]
+        subtasks.append({"title": "Implementation", "instructions": "Implement the change in the editable repo.",
+                         "specialty": "engineer", "strategy": "single"})
     for i, (title, spec, instr) in enumerate(picks):
         strategy = "single"
         if allow_swarm and (i == 0 or random.random() < 0.25):

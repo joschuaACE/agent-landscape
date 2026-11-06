@@ -131,7 +131,13 @@ class FileSandbox:
         if not raw or raw in (".", "/", ""):
             return self.roots[0]
         p = Path(os.path.expanduser(raw))
-        candidates = [p.resolve()] if p.is_absolute() else [(r / p).resolve() for r in self.roots]
+        if p.is_absolute():
+            candidates = [p.resolve()]
+        else:  # with several roots, rel() prefixes paths with the root's folder name – accept that form too
+            candidates = [(r / p).resolve() for r in self.roots]
+            candidates += [(r / Path(*p.parts[1:])).resolve() for r in self.roots
+                           if len(p.parts) > 1 and p.parts[0] == r.name]
+            candidates += [r for r in self.roots if p.parts == (r.name,)]
         for c in candidates:
             if any(c == r or c.is_relative_to(r) for r in self.roots):
                 if is_denied(c):

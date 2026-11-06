@@ -67,7 +67,8 @@ class Agent:
         self.name = name
         self.topic_id = topic_id
         self.parent_id = parent_id
-        self.model = model
+        self.model = model  # assigned by the mission / parent (re-set on every re-deployment)
+        self.pinned_model: str | None = None  # set by a human in the Unit panel – wins over everything
         self.depth = depth
         self.mode = mode
         self.options = options
@@ -160,10 +161,14 @@ class Agent:
                                      finished_at=time.time())
             self._inflight -= 1
             if self.persistent and self._inflight == 0:
-                self.set_status("idle", "Awaiting orders")
+                self.rest()
 
     async def run(self, text: str, ctx: TaskContext) -> str:  # pragma: no cover - abstract
         raise NotImplementedError
+
+    def rest(self) -> None:
+        """Status of a persistent unit between jobs."""
+        self.set_status("idle", "Awaiting orders")
 
     # ------------------------------------------------------------ helpers
     @property
@@ -187,11 +192,11 @@ class Agent:
                     temperature: float | None = None, model: str | None = None, use_tools: bool = True) -> str:
         """One LLM turn – with a tool loop when the mission has intel/tools attached.
 
-        Model: explicit > mission model (self.model) > profile model > DEFAULT_MODEL."""
+        Model: pinned (human, Unit panel) > explicit > mission model (self.model) > profile model > DEFAULT_MODEL."""
         prof = self.profile
         if temperature is None:
             temperature = prof.temperature if prof is not None and prof.temperature is not None else 0.7
-        model = model or self.model or (prof.model if prof is not None else None)
+        model = self.pinned_model or model or self.model or (prof.model if prof is not None else None)
         prev = (self.status, self.activity)
         self.set_status("thinking", activity)
         if self.memory and not self.persistent:
@@ -211,7 +216,8 @@ class Agent:
                 self.runtime.log(f"{self.name}: granted MCP tools unavailable ({exc})", agent=self, level="warn")
         tools = toolbox.specs(self) if toolbox else []
         messages: list[dict[str, Any]] = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
-        max_steps = self.runtime.settings.max_tool_steps
+        max_steps = (prof.max_tool_steps if prof is not None and prof.max_tool_steps
+                     else self.runtime.settings.max_tool_steps)
 
         if tools and self.runtime.settings.mock:  # exercise the tool plumbing without an LLM
             for name, args in toolbox.mock_plan(self):  # type: ignore[union-attr]
@@ -326,7 +332,20 @@ class Agent:
         return answer
 
     # --------------------------------------------------------------- view
+    def model_source(self) -> tuple[str | None, str]:
+        """(model, where it comes from) as used by the next LLM turn (orchestrators may still fall back to
+        ORCHESTRATOR_MODEL instead of DEFAULT_MODEL)."""
+        prof = self.profile
+        if self.pinned_model:
+            return self.pinned_model, "pinned"
+        if self.model:
+            return self.model, "mission"
+        if prof is not None and prof.model:
+            return prof.model, "profile"
+        return None, "default"
+
     def to_dict(self) -> dict[str, Any]:
+        model, source = self.model_source()
         return {
             "id": self.id,
             "name": self.name,
@@ -340,7 +359,9 @@ class Agent:
             "status": self.status,
             "objective": self.objective or None,
             "activity": self.activity,
-            "model": self.runtime.llm.resolve_model(self.model),
+            "model": self.runtime.llm.resolve_model(model),
+            "model_source": source,
+            "pinned_model": self.pinned_model,
             "tokens": self.tokens,
             "cost": round(self.cost, 6),
             "xp": self.xp,

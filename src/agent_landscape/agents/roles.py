@@ -41,7 +41,9 @@ def plan_system_prompt(profile: Any, workers: list[Any], max_subtasks: int, allo
     if allies:
         ally_text = "\nAllied agents:\n" + "\n".join(
             f'- id="{a["id"]}" {a["name"]}: {a["description"]}' for a in allies)
-    specialists = "\n".join(f'- "{w.key}" ({w.title}): {w.description or w.prompt[:120]}' for w in workers)
+    specialists = "\n".join(f'- "{w.key}" ({w.title}){" ✍️ can edit repos" if "repo_write" in w.tools else ""}'
+                            f'{" 🧪 can run tests/checks" if "checks" in w.tools else ""}: '
+                            f'{w.description or w.prompt[:120]}' for w in workers)
     plan = profile.prompts.get("plan") or (
         "Break the mission into at most {max_subtasks} focused subtasks that specialist agents can execute in parallel.")
     first = workers[0].key if workers else "researcher"
