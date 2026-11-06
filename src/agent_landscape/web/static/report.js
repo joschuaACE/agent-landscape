@@ -349,12 +349,17 @@ export function createReportView({ el, store, api, toast, map, onInspect, onChan
   function teamTab(d) {
     const rows = d.team.map((m) => `<tr data-rv="inspect" data-agent="${m.id}">
         <td>${m.icon} <b>${esc(m.name)}</b>${m.veteran ? ' 🎖️' : ''}</td><td>${esc(m.title)}</td><td>Lv ${m.level}</td>
-        <td>${m.tasks_done}</td><td>${fmt(m.tokens)}</td><td>$${(m.cost || 0).toFixed(4)}</td>
+        <td>${(m.models || []).map((x) => `<code title="${x.startsWith('claude-code/') ? 'Claude Code subscription – no tools' : 'LiteLLM gateway'}">${esc(x)}</code>`).join(' ') || '<span class="muted">–</span>'}</td>
+        <td title="${m.tasks_done} lifetime">${m.mission_tasks ?? m.tasks_done}</td>
+        <td title="${fmt(m.tokens)} lifetime">${fmt(m.mission_tokens ?? m.tokens)}</td>
+        <td title="$${(m.cost || 0).toFixed(4)} lifetime">$${(m.mission_cost ?? m.cost ?? 0).toFixed(4)}</td>
+        <td>${m.mission_notional_cost ? `🏷️ $${m.mission_notional_cost.toFixed(4)}` : '<span class="muted">–</span>'}</td>
         <td><span style="color:${stateColor(m.status === 'done' ? 'completed' : m.status)}">●</span> ${esc(m.status)}</td></tr>`).join('');
     return `<div class="rv-body"><div class="rv-doc">
-      <p class="muted small">Units that worked on this mission (all rounds). Tokens & cost are lifetime totals per unit – veterans may have served other missions too.</p>
-      <table class="rv-team"><thead><tr><th>Unit</th><th>Role</th><th>Level</th><th>Tasks</th><th>Tokens</th><th>Cost</th><th>Status</th></tr></thead>
-      <tbody>${rows || '<tr><td colspan="7" class="muted">No units yet.</td></tr>'}</tbody></table>
+      <p class="muted small">Units that worked on this mission (all rounds). Tasks, tokens and cost are for <b>this mission</b> – hover a value for the unit's lifetime total (veterans serve several missions).
+        🏷️ Notional = what Claude Code subscription calls would cost on the API (not billed).</p>
+      <table class="rv-team"><thead><tr><th>Unit</th><th>Role</th><th>Level</th><th>Model</th><th>Tasks</th><th>Tokens</th><th>Cost</th><th>Notional</th><th>Status</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="9" class="muted">No units yet.</td></tr>'}</tbody></table>
     </div></div>`;
   }
 

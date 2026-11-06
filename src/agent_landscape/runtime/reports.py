@@ -90,6 +90,19 @@ def _tree_order(entries: list[dict[str, Any]], root_ids: set[str]) -> list[dict[
     return out
 
 
+def _mission_usage(rounds: list[dict[str, Any]], agent_id: str) -> dict[str, Any]:
+    """One unit's usage in *this* mission (all rounds) – the unit's own totals are lifetime (veterans)."""
+    mine = [a for r in rounds for a in r["artifacts"] if a["agent_id"] == agent_id]
+    models = list(dict.fromkeys(str(a["model"]).removeprefix("litellm_proxy/") for a in mine if a.get("model")))
+    return {
+        "mission_tasks": len(mine),
+        "mission_tokens": sum(a["tokens"] or 0 for a in mine),
+        "mission_cost": round(sum(a["cost"] or 0 for a in mine), 6),
+        "mission_notional_cost": round(sum(a.get("notional_cost") or 0 for a in mine), 7),
+        "models": models,
+    }
+
+
 def build_report(rt: "Runtime", topic: "Topic") -> dict[str, Any]:
     tasks = sorted(rt.tasks.list(context_id=topic.id), key=lambda t: _md(t).get("created_at") or 0)
     commander_id = rt.commander.id if rt.commander else "commander"
@@ -130,8 +143,9 @@ def build_report(rt: "Runtime", topic: "Topic") -> dict[str, Any]:
         "topic": topic.to_dict(),
         "region": region.to_dict() if region else None,
         "rounds": rounds,
-        "team": [{k: m[k] for k in ("id", "name", "icon", "role", "title", "level", "veteran", "tokens", "cost",
-                                    "tasks_done", "status", "parent_id")} for m in team],
+        "team": [{**{k: m[k] for k in ("id", "name", "icon", "role", "title", "level", "veteran", "tokens", "cost",
+                                       "tasks_done", "status", "parent_id")}, **_mission_usage(rounds, m["id"])}
+                 for m in team],
         "totals": {
             "rounds": len(rounds),
             "a2a_tasks": sum(len(r["artifacts"]) for r in rounds) + len(cmd_tasks),

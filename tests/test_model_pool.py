@@ -86,6 +86,12 @@ async def test_auto_mission_assigns_pool_models(server):
         report = (await http.get(f"{base}/api/topics/{t.id}/report")).json()
         workers = [a for r in report["rounds"] for a in r["artifacts"] if a["role"] == "worker"]
         assert workers and all(a["model"] in POOL for a in workers)
+        team = {m["id"]: m for m in report["team"]}
+        for a in workers:  # team table: per-mission figures + the models each unit ran on
+            m = team[a["agent_id"]]
+            assert a["model"] in m["models"] and m["mission_tasks"] >= 1 and m["mission_tokens"] > 0
+            assert "mission_notional_cost" in m and m["mission_cost"] == pytest.approx(
+                sum(x["cost"] for r in report["rounds"] for x in r["artifacts"] if x["agent_id"] == a["agent_id"]))
 
         fixed = (await http.post(f"{base}/api/missions", json={**body, "model": "small-model"})).json()
         assert fixed["model_pool"] == []  # a forced model wins over the pool
