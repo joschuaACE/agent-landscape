@@ -304,7 +304,12 @@ You can register repos and attach them to a mission, e.g. a Copilot Studio solut
 - **Review & ship:** the report's **📦 Code** tab shows the branch, commits and the colored diff, with these actions:
   - **🧩 Open in VS Code**: opens the worktree, so you can amend, test or run `pac`.
   - **⬆️ Push branch**: a human-only action. Agents never push.
-  - Then open the PR in GitHub or Azure DevOps.
+  - **🔀 Create PR**: pushes the branch if needed and opens a pull request into the mission's base branch, with
+    *your* CLI login: `gh` for GitHub remotes (`gh auth login`), `az repos` for Azure DevOps remotes (`az login` +
+    `az extension add --name azure-devops`). The repo is taken from the worktree's own `origin`, so every registered
+    repo targets its own host. Title and description are prefilled from the mission (deliverable + commits) and editable;
+    an already open PR for the branch is reused. Other hosts: push and open the PR by hand.
+    `GH_BIN` / `AZ_BIN` override the CLI paths.
 - **Leftovers and cleanup:**
   - Uncommitted leftovers are auto-committed at the end of a round.
   - Feedback rounds reuse the same worktree and branch.

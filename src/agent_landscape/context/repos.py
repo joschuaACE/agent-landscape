@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fnmatch
+import json
 import logging
 import os
 import re
@@ -114,6 +115,7 @@ class MissionRepo:
     commits: list[dict[str, Any]] = field(default_factory=list)
     changed: list[str] = field(default_factory=list)  # "M path" vs base (incl. uncommitted)
     pushed: dict[str, Any] | None = None
+    pr: dict[str, Any] | None = None  # pull request opened by the human (url, number, host, at)
     checks: list[dict[str, Any]] = field(default_factory=list)  # run_check history (newest last)
 
     def to_dict(self) -> dict[str, Any]:
@@ -447,6 +449,126 @@ async def push(mr: MissionRepo) -> str:
     out = await git("push", "-u", "origin", f"{mr.branch}:{mr.branch}", cwd=mr.path, timeout=300)
     mr.pushed = {"at": time.time(), "branch": mr.branch, "sha": mr.commits[-1]["sha"]}
     return out.strip() or f"Pushed {mr.branch}"
+
+
+# ------------------------------------------------------------------ pull requests (human action)
+# CLIs that open the PR with *your* login (gh: keyring, az: `az login`). Overridable for tests / custom installs.
+GH_BIN = os.getenv("GH_BIN", "gh")
+AZ_BIN = os.getenv("AZ_BIN", "az")
+_GITHUB_RE = re.compile(r"^(?:https?://(?:[^@/]+@)?github\.com/|git@github\.com:|ssh://git@github\.com/)"
+                        r"(?P<owner>[\w.-]+)/(?P<repo>[\w.-]+?)(?:\.git)?/?$")
+_AZURE_RE = [
+    re.compile(r"^https://(?:[^@/]+@)?dev\.azure\.com/(?P<org>[^/]+)/(?P<project>[^/]+)/_git/(?P<repo>[^/?#]+)"),
+    re.compile(r"^(?:ssh://)?git@ssh\.dev\.azure\.com[:/]v3/(?P<org>[^/]+)/(?P<project>[^/]+)/(?P<repo>[^/]+)$"),
+    re.compile(r"^https://(?:[^@/]+@)?(?P<org>[\w-]+)\.visualstudio\.com/(?:DefaultCollection/)?"
+               r"(?P<project>[^/]+)/_git/(?P<repo>[^/?#]+)"),
+]
+
+
+def pr_target(url: str | None) -> dict[str, str] | None:
+    """Which host a remote URL belongs to and how to address it there (None = no PR support)."""
+    url = (url or "").strip()
+    if m := _GITHUB_RE.match(url):
+        return {"host": "github", "repo": f"{m['owner']}/{m['repo']}"}
+    for rx in _AZURE_RE:
+        if m := rx.match(url):
+            return {"host": "azure", "org": f"https://dev.azure.com/{m['org']}", "project": m["project"],
+                    "repo": m["repo"].removesuffix(".git")}
+    return None
+
+
+async def remote_url(mr: MissionRepo) -> str | None:
+    """origin of the worktree (local-checkout repos have no ``url`` in the registry)."""
+    try:
+        return (await git("remote", "get-url", "origin", cwd=mr.path, timeout=15)).strip() or None
+    except RepoError:
+        return mr.url
+
+
+async def _cli(argv: list[str], cwd: str, timeout: float = 120) -> str:
+    """Run gh / az non-interactively; errors carry the CLI's own message."""
+    if shutil.which(argv[0]) is None:
+        hint = ("install the GitHub CLI and run `gh auth login`" if argv[0] == GH_BIN else
+                "install the Azure CLI + `az extension add --name azure-devops`, then `az login`")
+        raise RepoError(f"{argv[0]} not found – {hint}")
+    env = {**os.environ, "GH_PROMPT_DISABLED": "1", "NO_COLOR": "1", "AZURE_CORE_NO_COLOR": "1"}
+    proc = await asyncio.create_subprocess_exec(*argv, cwd=cwd, env=env, stdin=asyncio.subprocess.DEVNULL,
+                                                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RepoError(f"{Path(argv[0]).name} timed out after {timeout:.0f}s") from None
+    if proc.returncode != 0:
+        msg = (err or out).decode(errors="replace").strip().splitlines()
+        raise RepoError(f"{Path(argv[0]).name} failed: {' / '.join(msg[-3:]) or proc.returncode}")
+    return out.decode(errors="replace")
+
+
+def base_branch(mr: MissionRepo) -> str:
+    return mr.base.removeprefix("origin/") if mr.base.startswith("origin/") else mr.base
+
+
+async def create_pr(mr: MissionRepo, title: str, body: str, *, draft: bool = False) -> dict[str, Any]:
+    """Human approval step: push the mission branch if needed, then open a PR on GitHub (gh) or Azure DevOps (az).
+
+    Reuses an already open PR for the branch instead of failing. Agents never call this."""
+    if not mr.write or not mr.branch:
+        raise RepoError("only editable mission repos have a branch for a pull request")
+    if not mr.commits:
+        raise RepoError("no commits on the mission branch yet")
+    target = pr_target(await remote_url(mr))
+    if target is None:
+        raise RepoError("pull requests are supported for GitHub and Azure DevOps remotes only – push and open it by hand")
+    title = " ".join(title.split())[:240] or mr.branch
+    body = body.strip()[:60_000]
+    cli = GH_BIN if target["host"] == "github" else AZ_BIN
+    if shutil.which(cli) is None:  # fail before pushing anything
+        await _cli([cli], mr.path)
+    if not (mr.pushed and mr.pushed.get("sha") == mr.commits[-1]["sha"]):
+        await push(mr)
+    base = base_branch(mr)
+    if target["host"] == "github":
+        pr = await _github_pr(mr, target, base, title, body, draft)
+    else:
+        pr = await _azure_pr(mr, target, base, title, body, draft)
+    mr.pr = {**pr, "host": target["host"], "base": base, "at": time.time()}
+    return mr.pr
+
+
+async def _github_pr(mr: MissionRepo, t: dict[str, str], base: str, title: str, body: str,
+                     draft: bool) -> dict[str, Any]:
+    existing = json.loads(await _cli([GH_BIN, "pr", "list", "--repo", t["repo"], "--head", mr.branch or "",
+                                      "--state", "open", "--json", "url,number"], mr.path) or "[]")
+    if existing:
+        return {"url": existing[0]["url"], "number": existing[0]["number"], "existing": True}
+    argv = [GH_BIN, "pr", "create", "--repo", t["repo"], "--head", mr.branch or "", "--base", base,
+            "--title", title, "--body", body or title] + (["--draft"] if draft else [])
+    out = await _cli(argv, mr.path)
+    url = next((ln.strip() for ln in reversed(out.splitlines()) if ln.strip().startswith("http")), "")
+    if not url:
+        raise RepoError(f"gh did not return a PR URL: {out.strip()[-300:]}")
+    num = url.rstrip("/").rsplit("/", 1)[-1]
+    return {"url": url, "number": int(num) if num.isdigit() else None}
+
+
+async def _azure_pr(mr: MissionRepo, t: dict[str, str], base: str, title: str, body: str,
+                    draft: bool) -> dict[str, Any]:
+    common = ["--organization", t["org"], "--project", t["project"], "--repository", t["repo"], "--output", "json"]
+    existing = json.loads(await _cli([AZ_BIN, "repos", "pr", "list", *common, "--status", "active",
+                                      "--source-branch", mr.branch or ""], mr.path) or "[]")
+    if existing:
+        data, reused = existing[0], True
+    else:
+        data = json.loads(await _cli([AZ_BIN, "repos", "pr", "create", *common, "--source-branch", mr.branch or "",
+                                      "--target-branch", base, "--title", title,
+                                      "--description", body or title] + (["--draft", "true"] if draft else []),
+                                     mr.path))
+        reused = False
+    pid = data.get("pullRequestId")
+    url = f"{t['org']}/{t['project']}/_git/{t['repo']}/pullrequest/{pid}"
+    return {"url": url, "number": pid, **({"existing": True} if reused else {})}
 
 
 def info(mr: MissionRepo) -> str:

@@ -186,13 +186,19 @@ export function createReportView({ el, store, api, toast, map, onInspect, onChan
           <dt>Worktree</dt><dd><code>${esc(r.path)}</code>${r.exists ? '' : ' (removed)'}</dd>
           ${r.url ? `<dt>Remote</dt><dd>${esc(r.url)}</dd>` : ''}
           ${r.pushed ? `<dt>Pushed</dt><dd>✅ ${esc(r.pushed.branch)} @ ${esc(r.pushed.sha)} · ${new Date(r.pushed.at * 1000).toLocaleString()}</dd>` : ''}
+          ${r.pr ? `<dt>Pull request</dt><dd>🔀 <a href="${esc(r.pr.url)}" target="_blank" rel="noopener">${r.pr.number ? `#${esc(String(r.pr.number))}` : esc(r.pr.url)}</a>
+            → <code>${esc(r.pr.base || '')}</code> · ${esc(r.pr.host === 'azure' ? 'Azure DevOps' : 'GitHub')}</dd>` : ''}
         </dl>
         <div class="rv-doc-tools" style="justify-content:flex-start">
           ${r.exists ? `<a class="btn small" href="${vs}" title="Open the mission worktree in VS Code">🧩 Open in VS Code</a>` : ''}
           ${r.branch ? `<button class="btn small" data-rv="copy-branch" data-branch="${esc(r.branch)}">📋 Branch name</button>` : ''}
           ${canPush ? `<button class="btn primary small" data-rv="push" data-repo="${esc(r.name)}" title="git push -u origin ${esc(r.branch)} – agents never push">⬆️ Push branch</button>` : ''}
+          ${r.write && r.commits.length && r.pr_host && !r.pr && s.prForm?.repo !== r.name
+            ? `<button class="btn primary small" data-rv="pr-open" data-repo="${esc(r.name)}" title="Push (if needed) and open a pull request with your ${r.pr_host === 'azure' ? 'az' : 'gh'} login – agents never do this">🔀 Create PR</button>` : ''}
+          ${r.pr ? `<a class="btn small" href="${esc(r.pr.url)}" target="_blank" rel="noopener">🔀 Open PR</a>` : ''}
           <button class="btn small" data-rv="code-refresh">⟳</button>
         </div>
+        ${s.prForm?.repo === r.name ? prFormHtml(s.prForm) : ''}
         ${r.error ? `<p class="status err">${esc(r.error)}</p>` : ''}
         ${r.commits.length ? `<h4>COMMITS (${r.commits.length})</h4><ul class="rv-intel">${r.commits.map((c) => `<li>🔖 <span><code>${esc(c.sha)}</code> <b>${esc(c.message)}</b>
             <br><small>${esc(c.author)} · ${clock(c.at)} · ${c.files.length} file(s): ${c.files.slice(0, 6).map(esc).join(', ')}${c.files.length > 6 ? ' …' : ''}</small></span></li>`).join('')}</ul>`
@@ -205,6 +211,21 @@ export function createReportView({ el, store, api, toast, map, onInspect, onChan
         (or open the worktree in VS Code to amend, test and push yourself). Dismissing the mission removes the worktree; branches with commits stay.</p>
       ${cards || '<p class="muted">No repositories attached.</p>'}
     </div></div>`;
+  }
+
+  function prFormHtml(f) {
+    if (f.loading) return '<p class="muted small">🔀 Preparing pull request…</p>';
+    return `<div class="rv-feedback" style="flex-direction:column;align-items:stretch;gap:6px;margin:8px 0">
+      <small class="muted">🔀 Pull request <code>${esc(f.branch)}</code> → <code>${esc(f.base)}</code> on ${f.host === 'azure' ? 'Azure DevOps' : 'GitHub'}
+        – pushes the branch first if needed. Review and edit before sending.</small>
+      <input data-rv-pr="title" value="${esc(f.title)}" placeholder="Title" maxlength="240">
+      <textarea data-rv-pr="body" rows="10" placeholder="Description (Markdown)">${esc(f.body)}</textarea>
+      <div style="display:flex;gap:8px;align-items:center">
+        <label class="small"><input type="checkbox" data-rv-pr="draft" ${f.draft ? 'checked' : ''}> Draft</label>
+        <span class="sep" style="flex:1"></span>
+        <button class="btn small" data-rv="pr-cancel">Cancel</button>
+        <button class="btn primary small" data-rv="pr-create" data-repo="${esc(f.repo)}" ${f.busy ? 'disabled' : ''}>${f.busy ? '⏳ Creating…' : '🔀 Create pull request'}</button>
+      </div></div>`;
   }
 
   function progress(round) {
@@ -349,7 +370,11 @@ export function createReportView({ el, store, api, toast, map, onInspect, onChan
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
-  el.addEventListener('input', (e) => { if (e.target.matches('[data-rv-draft]') && s) s.draft = e.target.value; });
+  el.addEventListener('input', (e) => {
+    if (e.target.matches('[data-rv-draft]') && s) s.draft = e.target.value;
+    const k = e.target.dataset?.rvPr;
+    if (k && s?.prForm) s.prForm[k] = k === 'draft' ? e.target.checked : e.target.value;
+  });
   el.addEventListener('focusout', () => setTimeout(() => { if (s?.pending) render(); }, 0));
   el.addEventListener('click', async (e) => {
     const btn = e.target.closest('[data-rv]');
@@ -372,6 +397,33 @@ export function createReportView({ el, store, api, toast, map, onInspect, onChan
       case 'node': s.task = btn.dataset.task; render(); break;
       case 'inspect': onInspect?.(btn.dataset.agent); break;
       case 'code-refresh': loadCode(); break;
+      case 'pr-open': {
+        const repo = btn.dataset.repo;
+        s.prForm = { repo, loading: true };
+        render();
+        try {
+          const d = await api(`/api/topics/${t.id}/repos/${encodeURIComponent(repo)}/pr`);
+          if (s?.prForm?.repo === repo) s.prForm = { repo, ...d, draft: false };
+        } catch { s.prForm = null; }
+        render();
+        break;
+      }
+      case 'pr-cancel': s.prForm = null; render(); break;
+      case 'pr-create': {
+        const f = s.prForm;
+        if (!f || f.busy) return;
+        f.busy = true;
+        render();
+        try {
+          const r = await api(`/api/topics/${t.id}/repos/${encodeURIComponent(f.repo)}/pr`, {
+            method: 'POST', body: JSON.stringify({ title: f.title, body: f.body, draft: f.draft }) });
+          toast('🔀', `${r.pr.existing ? 'Pull request already open' : 'Pull request opened'}: <a href="${esc(r.pr.url)}" target="_blank" rel="noopener">${esc(r.pr.url)}</a>`, 'success');
+          s.prForm = null;
+        } catch { if (s?.prForm) s.prForm.busy = false; }
+        loadCode();
+        render();
+        break;
+      }
       case 'copy-branch':
         await navigator.clipboard.writeText(btn.dataset.branch);
         toast('📋', `Copied <code>${esc(btn.dataset.branch)}</code>`);
