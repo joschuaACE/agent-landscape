@@ -843,9 +843,16 @@ async function loadModels() {
     modelList = models || [];
     const sel = $('#composer [name=model]');
     const keep = sel.value;
-    sel.innerHTML = `<option value="">default (${esc(def)})</option>` +
-      models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
-    sel.value = models.includes(keep) ? keep : ''; // drop stale picks
+    sel.innerHTML = `<option value="">default (${esc(def)})</option>`
+      + '<option value="auto">🧠 Auto – orchestrator picks per subtask</option>'
+      + `<optgroup label="Force for every agent">${models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('')}</optgroup>`;
+    sel.value = keep === 'auto' || models.includes(keep) ? keep : ''; // drop stale picks
+    const list = $('#cp-model-pool .cp-pool-list');
+    const was = new Set([...list.querySelectorAll('input:not(:checked)')].map((i) => i.value)); // keep unticks
+    list.innerHTML = models.map((m) => `<label class="small" title="${m.startsWith('claude-code/') ? 'No tools – text-only work' : 'Gateway model'}">
+      <input type="checkbox" name="model_pool" value="${esc(m)}" ${was.has(m) || m.startsWith('claude-code/') ? '' : 'checked'}>
+      ${esc(m)}${m.startsWith('claude-code/') ? ' <em class="muted">no tools</em>' : ''}</label>`).join('');
+    $('#cp-model-pool').hidden = sel.value !== 'auto';
     renderLlmPop();
   } catch { /* ignore */ }
 }

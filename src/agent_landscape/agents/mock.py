@@ -17,7 +17,8 @@ _SUBTASKS = [
 ]
 
 
-def mock_plan(max_subtasks: int, *, allow_swarm: bool, allow_delegate: bool, code: bool = False) -> str:
+def mock_plan(max_subtasks: int, *, allow_swarm: bool, allow_delegate: bool, code: bool = False,
+              models: list[str] | None = None) -> str:
     n = random.randint(2, max(2, max_subtasks))
     picks = random.sample(_SUBTASKS, n)
     subtasks = []
@@ -32,6 +33,8 @@ def mock_plan(max_subtasks: int, *, allow_swarm: bool, allow_delegate: bool, cod
         elif allow_delegate and i == 1 and random.random() < 0.7:
             strategy = "delegate"
         subtasks.append({"title": title, "instructions": instr, "specialty": spec, "strategy": strategy})
+    for st in subtasks if models else []:  # auto model mode: a real planner picks per complexity
+        st["model"] = random.choice(models)
     random.shuffle(subtasks)
     return json.dumps({"subtasks": subtasks})
 

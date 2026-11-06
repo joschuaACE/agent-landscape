@@ -31,7 +31,8 @@ class MissionRequest(BaseModel):
     title: str | None = Field(default=None, max_length=80)
     mode: str = "auto"  # auto | hierarchy | swarm
     swarm_size: int | None = Field(default=None, ge=2, le=12)
-    model: str | None = None
+    model: str | None = None  # a model = force it for every agent · "auto" = orchestrators pick per subtask
+    model_pool: list[str] = Field(default_factory=list, max_length=20)  # auto: allowed models ([] = all offered)
     region_id: str | None = None  # None → the Command HQ decides the region
     profile: str | None = None  # orchestrator / hive-leader profile for the mission's root agent
     context: list[ContextItem] = Field(default_factory=list, max_length=50)
@@ -168,7 +169,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                             swarm_size=req.swarm_size, model=req.model or None,
                                             region_id=req.region_id or None, context=req.context,
                                             profile=req.profile or None, new_region=req.new_region or None,
-                                            proposal_id=req.proposal_id or None)
+                                            proposal_id=req.proposal_id or None,
+                                            model_pool=req.model_pool or None)
         return topic.to_dict()
 
     # ------------------------------------------------------------ teams

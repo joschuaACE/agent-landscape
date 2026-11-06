@@ -279,6 +279,7 @@ export function createReportView({ el, store, api, toast, map, onInspect, onChan
         <dl class="kv" style="margin:0">
           <dt>Formation</dt><dd>${{ auto: '🧠 Auto', hierarchy: '🏰 Hierarchy', swarm: '🐝 Swarm' }[t.mode] || esc(t.mode)}</dd>
           <dt>Region</dt><dd>${reg ? `${reg.icon} ${esc(reg.name)} · ${esc(reg.biome_label)}` : '–'}</dd>
+          ${t.model_pool?.length ? `<dt>Models</dt><dd>🧠 Auto – orchestrator picks from ${t.model_pool.map((m) => `<code>${esc(m)}</code>`).join(' ')}</dd>` : ''}
           <dt>Started</dt><dd>${new Date(t.created_at * 1000).toLocaleString()}</dd>
           <dt>A2A context</dt><dd><code>${esc(t.id)}</code></dd>
         </dl></section>

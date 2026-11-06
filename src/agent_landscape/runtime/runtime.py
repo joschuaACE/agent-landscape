@@ -75,6 +75,8 @@ class Topic:
     context: list[dict[str, Any]] = field(default_factory=list)  # attached intel (summary, incl. errors)
     knowledge: list[dict[str, Any]] = field(default_factory=list)  # linked knowledge bases (vector stores)
     team: str | None = None  # key of the team (teams.yaml) that runs this mission
+    # auto model mode: orchestrators pick a model per subtask from this pool ([] = default / fixed model)
+    model_pool: list[str] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     finished_at: float | None = None
 
@@ -87,7 +89,7 @@ class Topic:
             "root_agent_id": self.root_agent_id, "task_id": self.task_id,
             "result": self.result, "rounds": self.rounds, "feedback": self.feedback,
             "tokens": self.tokens, "cost": round(self.cost, 6), "context": self.context,
-            "knowledge": self.knowledge, "team": self.team,
+            "knowledge": self.knowledge, "team": self.team, "model_pool": self.model_pool,
             "created_at": self.created_at, "finished_at": self.finished_at,
         }
 
@@ -546,7 +548,8 @@ class Runtime:
                             swarm_size: int | None = None, model: str | None = None,
                             region_id: str | None = None, context: list[ContextItem] | None = None,
                             profile: str | None = None, new_region: dict[str, str] | None = None,
-                            proposal_id: str | None = None, team: str | None = None) -> Topic:
+                            proposal_id: str | None = None, team: str | None = None,
+                            model_pool: list[str] | None = None) -> Topic:
         """Create a mission and hand it to the Commander via A2A (it surveys + places the territory).
 
         Context travels A2A-natively: files as FileParts, references as a DataPart.
@@ -560,8 +563,14 @@ class Runtime:
                 str(new_region.get("name") or title or "New Frontier"), str(new_region.get("description") or goal),
                 str(new_region.get("biome") or ""))).id
         topic = self.create_topic(title or short(goal, 48), goal, mode)
+        if model == "auto":  # A2A clients may send model="auto" (+ optional model_pool)
+            model = None
+            model_pool = model_pool or ["*"]
+        if model_pool and not model:
+            topic.model_pool = await self.resolve_model_pool(model_pool)
         if team:
             topic.team = team
+        if team or topic.model_pool:
             self.topic_changed(topic)
         if proposal_id:
             self.ops.approved(proposal_id, topic.id)
@@ -573,6 +582,15 @@ class Runtime:
         self.emit_message("user", self.commander.id, "request", goal)
         self._dispatch(msg)
         return topic
+
+    async def resolve_model_pool(self, pool: list[str]) -> list[str]:
+        """Auto model mode: keep known models (``*`` = all offered), order as in the picker, max 20."""
+        known = await self.llm.list_models()
+        wanted = [str(m).strip() for m in pool if str(m).strip()]
+        if "*" in wanted:
+            return known[:20] or [self.settings.default_model]
+        picked = [m for m in known if m in wanted] if known else wanted
+        return list(dict.fromkeys(picked))[:20]
 
     async def send_followup(self, topic_id: str, text: str,
                             context: list[ContextItem] | None = None) -> Topic | None:

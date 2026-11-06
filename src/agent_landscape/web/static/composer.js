@@ -77,8 +77,11 @@ export function createComposer({ el, store, api, toast, onDeployed }) {
     const slider = f.namedItem('swarm_size');
     slider.value = store.config.default_swarm_size || 3;
     el.querySelector('#swarm-size-out').textContent = slider.value;
+    syncModelPool();
     render();
   }
+  function syncModelPool() { el.querySelector('#cp-model-pool').hidden = f.namedItem('model').value !== 'auto'; }
+  f.namedItem('model').addEventListener('change', syncModelPool);
 
   // ------------------------------------------------------------- profiles
   let profiles = [];
@@ -283,9 +286,12 @@ export function createComposer({ el, store, api, toast, onDeployed }) {
     const context = items.map(({ kind, name, content, mime, path, url, tool, store: kb, repo, ref, write }) =>
       ({ kind, name, content, mime, path, url, tool, store: kb, repo, ref, write: !!write }));
     const region = f.namedItem('region_id').value;
+    const model = f.namedItem('model').value || null;
+    const pool = model === 'auto' ? [...form.querySelectorAll('[name=model_pool]:checked')].map((i) => i.value) : [];
+    if (model === 'auto' && !pool.length) { toast('⚠️', 'Pick at least one model for the auto pool', 'error'); return; }
     const body = {
       goal: text, title: f.namedItem('title').value.trim() || null, mode: f.namedItem('mode').value,
-      swarm_size: Number(f.namedItem('swarm_size').value), model: f.namedItem('model').value || null,
+      swarm_size: Number(f.namedItem('swarm_size').value), model, model_pool: pool,
       region_id: region && region !== NEW_REGION ? region : null, profile: f.namedItem('profile').value || null, context,
       proposal_id: proposal?.id || null, new_region: region === NEW_REGION ? proposal?.new_region || null : null,
     };

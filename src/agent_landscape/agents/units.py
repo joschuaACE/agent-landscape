@@ -213,8 +213,26 @@ class Orchestrator(Agent):
         """mission model > profile model > ORCHESTRATOR_MODEL > DEFAULT_MODEL"""
         return self.model or self._prof().model or self.runtime.settings.orchestrator_model
 
+    def _pool(self) -> list[str]:
+        """Auto model mode: the models this mission's orchestrators may assign per subtask."""
+        topic = self.runtime.topics.get(self.topic_id)
+        return list(topic.model_pool) if topic is not None else []
+
+    def _pick_model(self, st: dict[str, Any]) -> str | None:
+        """The subtask's model: the planner's choice if it is in the pool, else this orchestrator's own setting."""
+        pool = self._pool()
+        wanted = str(st.get("model") or "").strip()
+        if not pool or not wanted:
+            return self.model
+        if wanted in pool:
+            return wanted
+        self.runtime.log(f"{self.name}: model '{wanted}' is not in the mission's pool – using the default",
+                         agent=self, level="warn")
+        return self.model
+
     def _child_for(self, st: dict[str, Any]) -> Agent:
         s = self.runtime.settings
+        model = self._pick_model(st)
         strategy = str(st.get("strategy", "single")).lower()
         if self.mode == "hierarchy" and strategy == "swarm":
             strategy = "single"
@@ -243,8 +261,8 @@ class Orchestrator(Agent):
         veteran = rt.find_veteran(cls, region_id=rt.topics[self.topic_id].region_id, parent=self,
                                   specialty=specialty)
         if veteran is not None:
-            return rt.recruit(veteran, parent=self, topic_id=self.topic_id, model=self.model)
-        return self.spawn(cls, depth=self.depth + 1, model=self.model, **kwargs)
+            return rt.recruit(veteran, parent=self, topic_id=self.topic_id, model=model)
+        return self.spawn(cls, depth=self.depth + 1, model=model, **kwargs)
 
     @staticmethod
     def _team_entry(agent: Agent) -> tuple[str, str, str]:
@@ -268,7 +286,8 @@ class Orchestrator(Agent):
                        + "\n".join(f"- {a.name}: {spec} / {strat} – earlier: {short(t, 80)}"
                                    for a, (t, spec, strat) in ((a, self._team_entry(a)) for a in team)))
         raw = await self.think(
-            plan_system_prompt(self._prof(), self._workers(), s.max_subtasks, allow_delegate, allow_swarm, allies),
+            plan_system_prompt(self._prof(), self._workers(), s.max_subtasks, allow_delegate, allow_swarm, allies,
+                               models=self._pool()),
             prompt,
             activity="Revising battle plan" if followup else "Drafting battle plan",
             temperature=0.2,
@@ -277,7 +296,8 @@ class Orchestrator(Agent):
             if followup and team else mock.mock_plan(s.max_subtasks, allow_swarm=allow_swarm,
                                                      allow_delegate=allow_delegate and self.depth == 1,
                                                      code=any(r.write for r in getattr(
-                                                         rt.intel.get(self.topic_id), "repos", []))),
+                                                         rt.intel.get(self.topic_id), "repos", [])),
+                                                     models=self._pool()),
         )
         plan = parse_plan(raw, s.max_subtasks) or [
             {"title": "Execute mission", "instructions": text, "specialty": "researcher", "strategy": "single"}]
@@ -285,6 +305,10 @@ class Orchestrator(Agent):
 
         self.set_status("delegating", f"Dispatching {len(plan)} units")
         children = [self._child_for(st) for st in plan]
+        if self._pool():
+            self.runtime.log(f"{self.name} assigned models: " + ", ".join(
+                f"{str(st.get('title') or 'Subtask')[:40]} → {c.model or 'default'}" for c, st in zip(children, plan, strict=True)),
+                agent=self)
         await asyncio.sleep(0.4)
         coros = []
         for child, st in zip(children, plan):
@@ -435,6 +459,9 @@ class Commander(Agent):
             topic = rt.create_topic(title=md.get("title") or short(text, 48), goal=text,
                                     mode=md.get("mode", "auto"), topic_id=ctx.task.context_id)
         topic.task_id = ctx.task.id
+        if not followup and not topic.model_pool and (md.get("model") == "auto" or md.get("model_pool")):
+            pool = md.get("model_pool") if isinstance(md.get("model_pool"), list) else ["*"]
+            topic.model_pool = await rt.resolve_model_pool(pool)  # external A2A client asked for auto
 
         self.active_missions += 1
         self.set_status("delegating", f"Commanding {self.active_missions} mission(s)")
@@ -458,7 +485,8 @@ class Commander(Agent):
                 rt.link_recalled_knowledge(topic, recall)
                 briefing = recall_briefing(recall)
                 prompt = f"{text}\n\n{briefing}" if briefing else text
-            root = self._root_for(topic, md.get("model") or None, followup, md.get("profile") or None)
+            model = None if md.get("model") == "auto" or topic.model_pool else (md.get("model") or None)
+            root = self._root_for(topic, model, followup, md.get("profile") or None)
             topic.root_agent_id = root.id
             rt.topic_changed(topic)
             result = await self.delegate(root, prompt, metadata={
