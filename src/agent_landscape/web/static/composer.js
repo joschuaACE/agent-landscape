@@ -289,6 +289,14 @@ export function createComposer({ el, store, api, toast, onDeployed }) {
     const model = f.namedItem('model').value || null;
     const pool = model === 'auto' ? [...form.querySelectorAll('[name=model_pool]:checked')].map((i) => i.value) : [];
     if (model === 'auto' && !pool.length) { toast('⚠️', 'Pick at least one model for the auto pool', 'error'); return; }
+    // claude-code/* runs without tools: agents could neither read nor change attached repos / files / MCP tools
+    const toolLess = (m) => String(m || '').startsWith('claude-code/');
+    const allToolLess = model === 'auto' ? pool.every(toolLess) : toolLess(model || store.config.default_model);
+    const needsTools = items.some((i) => ['repo', 'path', 'tool', 'store'].includes(i.kind));
+    if (allToolLess && needsTools && !confirm(
+      'All selected models are claude-code/* – they run WITHOUT tools.\n\n'
+      + 'Agents will not be able to read or edit the attached repositories, files, knowledge bases or MCP tools '
+      + '(an editable repo will get no commits).\n\nTick a gateway model in the pool (or force one). Deploy anyway?')) return;
     const body = {
       goal: text, title: f.namedItem('title').value.trim() || null, mode: f.namedItem('mode').value,
       swarm_size: Number(f.namedItem('swarm_size').value), model, model_pool: pool,
